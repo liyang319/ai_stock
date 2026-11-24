@@ -36,6 +36,7 @@ INDEXES = [
 
 PERIODS = {"日K": "daily", "周K": "weekly", "月K": "monthly"}
 RANGES = {"3个月": 90, "6个月": 180, "1年": 365, "3年": 1095, "全部": None}
+REFRESH_OPTIONS = {"关闭": 0, "15秒": 15, "30秒": 30, "60秒": 60}
 
 WATCHLIST_FILE = Path(
     os.environ.get("WATCHLIST_FILE", Path(__file__).with_name("watchlist.json"))
@@ -114,7 +115,7 @@ def remove_from_watchlist(code: str) -> None:
 
 # ---------------------------------------------------------------- 数据接口
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_index_spot() -> pd.DataFrame:
     """大盘指数实时行情，优先新浪，失败则回退东方财富。"""
     try:
@@ -138,7 +139,7 @@ def get_index_spot() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def get_a_spot() -> pd.DataFrame:
     """沪深京 A 股实时快照（含名称、最新价、昨收、涨跌幅）。"""
     df = ak.stock_zh_a_spot().copy()
@@ -157,7 +158,7 @@ def get_stock_index() -> pd.DataFrame:
     return spot
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
     df = ak.stock_zh_a_daily(
         symbol=with_prefix(symbol),
@@ -188,7 +189,7 @@ def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out.reset_index()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_kline(symbol: str, period: str, start_date: str, end_date: str) -> pd.DataFrame:
     daily = get_daily(symbol, start_date, end_date)
     if daily.empty or period == "daily":
@@ -196,7 +197,7 @@ def get_kline(symbol: str, period: str, start_date: str, end_date: str) -> pd.Da
     return _resample(daily, "W-FRI" if period == "weekly" else "ME")
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False)
 def get_intraday(symbol: str) -> pd.DataFrame:
     """最近一个交易日的 1 分钟分时数据。"""
     df = ak.stock_zh_a_minute(symbol=with_prefix(symbol), period="1", adjust="")
@@ -446,9 +447,7 @@ def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
                 st.rerun()
 
 
-def main() -> None:
-    st.title("📈 股票行情助手")
-
+def render_index_panel() -> None:
     try:
         index_spot = get_index_spot()
         render_index_cards(index_spot)
@@ -456,6 +455,41 @@ def main() -> None:
     except Exception as exc:
         st.warning(f"大盘指数获取失败：{exc}")
 
+
+def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> None:
+    codes = st.session_state.get("watchlist", [])
+    if not codes:
+        st.info("自选看板为空：在上方输入代码或名称首字母，选择匹配结果后点击「添加」。")
+        return
+    try:
+        spot = get_a_spot()
+    except Exception as exc:
+        spot = pd.DataFrame()
+        st.caption(f"个股快照获取失败：{exc}")
+    with st.spinner("加载自选图表…"):
+        for i in range(0, len(codes), 4):
+            cols = st.columns(4)
+            for col, code in zip(cols, codes[i:i + 4]):
+                render_watch_card(col, code, spot, chart_type, period_label, range_label)
+    st.caption(f"自选图表更新于 {dt.datetime.now():%H:%M:%S}")
+
+
+def main() -> None:
+    title_col, refresh_col = st.columns([4.5, 1], vertical_alignment="bottom")
+    with title_col:
+        st.title("📈 股票行情助手")
+    with refresh_col:
+        refresh_label = st.selectbox("自动刷新", list(REFRESH_OPTIONS.keys()), index=2)
+
+    refresh = REFRESH_OPTIONS[refresh_label]
+    if refresh:
+        index_panel = st.fragment(render_index_panel, run_every=refresh)
+        watch_panel = st.fragment(render_watch_panel, run_every=refresh)
+    else:
+        index_panel = render_index_panel
+        watch_panel = render_watch_panel
+
+    index_panel()
     st.divider()
 
     if "watchlist" not in st.session_state:
@@ -466,12 +500,6 @@ def main() -> None:
     except Exception as exc:
         stock_index = pd.DataFrame(columns=["代码", "名称", "首字母"])
         st.warning(f"股票列表获取失败，暂时只能按代码添加：{exc}")
-
-    try:
-        spot = get_a_spot()
-    except Exception as exc:
-        spot = pd.DataFrame()
-        st.caption(f"个股快照获取失败：{exc}")
 
     st.subheader("自选看板")
 
@@ -500,22 +528,11 @@ def main() -> None:
 
     c1, c2, c3 = st.columns([1.4, 1, 1])
     chart_type = c1.radio("图表类型", ["K线", "分时"], horizontal=True)
-    if chart_type == "K线":
-        period_label = c2.selectbox("K线周期", list(PERIODS.keys()))
-        range_label = c3.selectbox("时间范围", list(RANGES.keys()), index=2)
-    else:
-        period_label, range_label = "日K", "1年"
+    is_kline = chart_type == "K线"
+    period_label = c2.selectbox("K线周期", list(PERIODS.keys()), disabled=not is_kline)
+    range_label = c3.selectbox("时间范围", list(RANGES.keys()), index=2, disabled=not is_kline)
 
-    codes = st.session_state.watchlist
-    if not codes:
-        st.info("自选看板为空：在上方输入代码或名称首字母，选择匹配结果后点击「添加」。")
-        return
-
-    with st.spinner("加载自选图表…"):
-        for i in range(0, len(codes), 4):
-            cols = st.columns(4)
-            for col, code in zip(cols, codes[i:i + 4]):
-                render_watch_card(col, code, spot, chart_type, period_label, range_label)
+    watch_panel(chart_type, period_label, range_label)
 
 
 if __name__ == "__main__":
