@@ -19,6 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from pypinyin import Style, lazy_pinyin
+from streamlit_sortables import sort_items
 
 st.set_page_config(page_title="股票行情助手", page_icon="📈", layout="wide")
 
@@ -447,6 +448,43 @@ def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
                 st.rerun()
 
 
+def reorder_codes(sorted_labels, labels, label_to_code, current_codes):
+    """应用拖拽结果：只有标签集合完全一致时才生效，避免增删股票时误覆盖。"""
+    if not sorted_labels or set(sorted_labels) != set(labels):
+        return current_codes
+    try:
+        return [label_to_code[lab] for lab in sorted_labels]
+    except KeyError:
+        return current_codes
+
+
+def apply_sort_order(stock_index: pd.DataFrame) -> None:
+    codes = st.session_state.watchlist
+    if len(codes) < 2:
+        return
+    name_of = dict(zip(stock_index["代码"], stock_index["名称"])) if not stock_index.empty else {}
+    label_of = {c: f"{name_of.get(c) or c}　{c}" for c in codes}
+    label_to_code = {lab: c for c, lab in label_of.items()}
+    labels = [label_of[c] for c in codes]
+    sorted_labels = sort_items(
+        labels,
+        direction="horizontal",
+        custom_style=(
+            ".sortable-container-body{display:flex;flex-wrap:wrap;"
+            "background:transparent;padding:0;min-height:auto}"
+            ".sortable-item,.sortable-item:hover,.sortable-item:active{"
+            "border-radius:999px;padding:2px 12px;margin:4px;"
+            "font-size:0.9rem;background:#eef1f6;color:#333;white-space:nowrap;"
+            "box-shadow:none}"
+        ),
+        key="watch_sort",
+    )
+    new_codes = reorder_codes(sorted_labels, labels, label_to_code, codes)
+    if new_codes != codes:
+        st.session_state.watchlist = new_codes
+        save_watchlist(new_codes)
+
+
 def render_index_panel() -> None:
     try:
         index_spot = get_index_spot()
@@ -531,6 +569,10 @@ def main() -> None:
     is_kline = chart_type == "K线"
     period_label = c2.selectbox("K线周期", list(PERIODS.keys()), disabled=not is_kline)
     range_label = c3.selectbox("时间范围", list(RANGES.keys()), index=2, disabled=not is_kline)
+
+    if len(st.session_state.watchlist) >= 2:
+        st.caption("拖动下方标签可调整自选看板顺序")
+        apply_sort_order(stock_index)
 
     watch_panel(chart_type, period_label, range_label)
 
