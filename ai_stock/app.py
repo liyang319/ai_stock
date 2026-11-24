@@ -1,4 +1,4 @@
-"""股票行情助手：大盘指数 + 个股 K 线（日/周/月）与分时图。
+"""股票行情助手：大盘指数 + 自选看板（K线/分时，点击放大，持久化）。
 
 运行方式：
     streamlit run app.py
@@ -7,7 +7,10 @@
 """
 
 import datetime as dt
+import json
+import os
 import re
+from pathlib import Path
 
 import akshare as ak
 import numpy as np
@@ -15,6 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from pypinyin import Style, lazy_pinyin
 
 st.set_page_config(page_title="股票行情助手", page_icon="📈", layout="wide")
 
@@ -32,6 +36,10 @@ INDEXES = [
 
 PERIODS = {"日K": "daily", "周K": "weekly", "月K": "monthly"}
 RANGES = {"3个月": 90, "6个月": 180, "1年": 365, "3年": 1095, "全部": None}
+
+WATCHLIST_FILE = Path(
+    os.environ.get("WATCHLIST_FILE", Path(__file__).with_name("watchlist.json"))
+)
 
 
 def normalize_code(raw: str) -> str:
@@ -61,6 +69,50 @@ def color_of(value) -> str:
         return FLAT_COLOR
     return UP_COLOR if value > 0 else DOWN_COLOR if value < 0 else FLAT_COLOR
 
+
+def name_initials(name: str) -> str:
+    py = "".join(lazy_pinyin(str(name), style=Style.FIRST_LETTER)).lower()
+    return re.sub(r"[^a-z0-9]", "", py)
+
+
+# ---------------------------------------------------------------- 自选持久化
+
+def load_watchlist() -> list[str]:
+    try:
+        data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    codes = []
+    for raw in data:
+        code = normalize_code(raw)
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def save_watchlist(codes: list[str]) -> None:
+    try:
+        WATCHLIST_FILE.write_text(
+            json.dumps(codes, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        st.warning(f"自选列表保存失败：{exc}")
+
+
+def add_to_watchlist(code: str) -> None:
+    if code not in st.session_state.watchlist:
+        st.session_state.watchlist.append(code)
+        save_watchlist(st.session_state.watchlist)
+
+
+def remove_from_watchlist(code: str) -> None:
+    st.session_state.watchlist = [
+        c for c in st.session_state.watchlist if c != code
+    ]
+    save_watchlist(st.session_state.watchlist)
+
+
+# ---------------------------------------------------------------- 数据接口
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_index_spot() -> pd.DataFrame:
@@ -95,6 +147,14 @@ def get_a_spot() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_stock_index() -> pd.DataFrame:
+    """代码 / 名称 / 名称拼音首字母，用于自选搜索。"""
+    spot = get_a_spot()[["代码", "名称"]].copy()
+    spot["首字母"] = spot["名称"].map(name_initials)
+    return spot
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -152,33 +212,42 @@ def get_intraday(symbol: str) -> pd.DataFrame:
     return df
 
 
-def render_index_cards(spot: pd.DataFrame) -> None:
-    cols = st.columns(len(INDEXES))
-    for col, (code, label) in zip(cols, INDEXES):
-        row = spot[spot["代码"] == code]
-        with col:
-            if row.empty:
-                col.markdown(f"**{label}**\n\n暂无数据")
-                continue
-            r = row.iloc[0]
-            price = to_float(r.get("最新价"))
-            chg = to_float(r.get("涨跌额"))
-            pct = to_float(r.get("涨跌幅"))
-            color = color_of(chg)
-            price_txt = f"{price:,.2f}" if price is not None else "--"
-            chg_txt = f"{chg:+.2f}" if chg is not None else "--"
-            pct_txt = f"{pct:+.2f}%" if pct is not None else "--"
-            col.markdown(
-                f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:12px 14px;background:#fff">
-<div style="color:#555;font-size:0.92rem">{label} <span style="color:#999">{code}</span></div>
-<div style="color:{color};font-size:1.55rem;font-weight:700;line-height:1.4">{price_txt}</div>
-<div style="color:{color};font-size:0.92rem">{chg_txt}　{pct_txt}</div>
-</div>""",
-                unsafe_allow_html=True,
-            )
+def load_kline(code: str, period_label: str, range_label: str) -> pd.DataFrame:
+    days = RANGES[range_label]
+    today = dt.date.today()
+    start = "19900101" if days is None else (today - dt.timedelta(days=days)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
+    return get_kline(code, PERIODS[period_label], start, end)
 
 
-def make_kline_fig(df: pd.DataFrame, title: str) -> go.Figure:
+def resolve_stocks(query: str, index_df: pd.DataFrame) -> list[tuple[str, str]]:
+    """按 6 位代码、名称首字母或名称片段匹配股票。"""
+    q = query.strip()
+    if not q:
+        return []
+    if re.fullmatch(r"\d{6}", q):
+        if index_df.empty:
+            return [(q, "")]
+        row = index_df[index_df["代码"] == q]
+        return [(q, str(row.iloc[0]["名称"]))] if not row.empty else []
+    if index_df.empty:
+        return []
+    letters = re.sub(r"[^a-z]", "", q.lower())
+    if letters:
+        exact = index_df[index_df["首字母"] == letters]
+        if not exact.empty:
+            return list(zip(exact["代码"], exact["名称"].astype(str)))
+        prefix = index_df[index_df["首字母"].str.startswith(letters)]
+        if not prefix.empty:
+            return list(zip(prefix["代码"], prefix["名称"].astype(str)))
+    hit = index_df[index_df["名称"].astype(str).str.contains(q, regex=False)]
+    return list(zip(hit["代码"], hit["名称"].astype(str)))
+
+
+# ---------------------------------------------------------------- 图表
+
+def make_kline_fig(df: pd.DataFrame, title: str = "", height: int = 620,
+                   compact: bool = False) -> go.Figure:
     vol_colors = np.where(df["收盘"] >= df["开盘"], UP_COLOR, DOWN_COLOR)
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
@@ -198,21 +267,30 @@ def make_kline_fig(df: pd.DataFrame, title: str) -> go.Figure:
         row=2, col=1,
     )
     fig.update_layout(
-        title=dict(text=title, x=0, xanchor="left"),
         template="plotly_white",
-        height=620,
-        margin=dict(l=10, r=10, t=50, b=10),
+        height=height,
+        margin=dict(l=4, r=4, t=10, b=4) if compact else dict(l=10, r=10, t=50, b=10),
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
     )
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    fig.update_yaxes(title_text="价格", row=1, col=1)
-    fig.update_yaxes(title_text="成交量", row=2, col=1)
+    if compact:
+        fig.update_layout(showlegend=False)
+        fig.update_xaxes(nticks=4)
+        fig.update_yaxes(showticklabels=False, row=1, col=1)
+        fig.update_yaxes(showticklabels=False, row=2, col=1)
+    else:
+        fig.update_layout(
+            title=dict(text=title, x=0, xanchor="left"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
+        )
+        fig.update_yaxes(title_text="价格", row=1, col=1)
+        fig.update_yaxes(title_text="成交量", row=2, col=1)
     return fig
 
 
-def make_intraday_fig(df: pd.DataFrame, prev_close, title: str) -> go.Figure:
+def make_intraday_fig(df: pd.DataFrame, prev_close, title: str = "",
+                      height: int = 620, compact: bool = False) -> go.Figure:
     price = df["收盘"]
     volume = df["成交量"].fillna(0)
     cum_vol = volume.cumsum().replace(0, np.nan)
@@ -240,7 +318,7 @@ def make_intraday_fig(df: pd.DataFrame, prev_close, title: str) -> go.Figure:
     if prev_close:
         fig.add_hline(
             y=prev_close, line=dict(color="#999", width=1, dash="dash"),
-            annotation_text=f"昨收 {prev_close:.2f}",
+            annotation_text=f"昨收 {prev_close:.2f}" if not compact else None,
             annotation_position="top left",
             row=1, col=1,
         )
@@ -249,117 +327,195 @@ def make_intraday_fig(df: pd.DataFrame, prev_close, title: str) -> go.Figure:
         row=2, col=1,
     )
     fig.update_layout(
-        title=dict(text=title, x=0, xanchor="left"),
         template="plotly_white",
-        height=620,
-        margin=dict(l=10, r=10, t=50, b=10),
+        height=height,
+        margin=dict(l=4, r=4, t=10, b=4) if compact else dict(l=10, r=10, t=50, b=10),
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
     )
-    fig.update_xaxes(type="category", nticks=12, row=2, col=1)
-    fig.update_yaxes(title_text="价格", row=1, col=1)
-    fig.update_yaxes(title_text="成交量", row=2, col=1)
+    fig.update_xaxes(type="category", nticks=6 if compact else 12, row=2, col=1)
+    if compact:
+        fig.update_layout(showlegend=False)
+        fig.update_yaxes(showticklabels=False, row=1, col=1)
+        fig.update_yaxes(showticklabels=False, row=2, col=1)
+    else:
+        fig.update_layout(
+            title=dict(text=title, x=0, xanchor="left"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
+        )
+        fig.update_yaxes(title_text="价格", row=1, col=1)
+        fig.update_yaxes(title_text="成交量", row=2, col=1)
     return fig
 
 
-def render_stock_header(code: str) -> dict:
-    """展示个股名称与实时价格，返回快照信息。"""
-    info = {}
-    try:
-        spot = get_a_spot()
-        row = spot[spot["代码"] == code]
-        if not row.empty:
-            info = row.iloc[0].to_dict()
-    except Exception as exc:
-        st.caption(f"实时快照获取失败：{exc}")
-
-    name = str(info.get("名称", "")).strip()
+@st.dialog("图表放大", width="large")
+def show_enlarged(code: str, name: str, chart_type: str,
+                  period_label: str, range_label: str, prev_close=None) -> None:
     heading = f"{name}（{code}）" if name else code
-    price = to_float(info.get("最新价"))
-    chg = to_float(info.get("涨跌额"))
-    pct = to_float(info.get("涨跌幅"))
+    try:
+        if chart_type == "分时":
+            df = get_intraday(code)
+            if df.empty:
+                st.info("暂无分时数据（可能为非交易日或停牌）。")
+                return
+            day = df["时间"].dt.strftime("%Y-%m-%d").iloc[-1]
+            fig = make_intraday_fig(df, prev_close, f"{heading}　分时 {day}", height=640)
+        else:
+            df = load_kline(code, period_label, range_label)
+            if df.empty:
+                st.info("暂无 K 线数据。")
+                return
+            fig = make_kline_fig(df, f"{heading}　{period_label}", height=640)
+    except Exception as exc:
+        st.error(f"图表数据获取失败：{exc}")
+        return
+    st.plotly_chart(fig, width="stretch", key=f"big_{chart_type}_{code}")
 
-    if price is not None and chg is not None and pct is not None:
-        color = color_of(chg)
-        st.markdown(
-            f"### {heading}　<span style='color:{color}'>"
-            f"{price:.2f}　{chg:+.2f}（{pct:+.2f}%）</span>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.subheader(heading)
-    return info
+
+# ---------------------------------------------------------------- 页面
+
+def render_index_cards(spot: pd.DataFrame) -> None:
+    cols = st.columns(len(INDEXES))
+    for col, (code, label) in zip(cols, INDEXES):
+        row = spot[spot["代码"] == code]
+        with col:
+            if row.empty:
+                col.markdown(f"**{label}**\n\n暂无数据")
+                continue
+            r = row.iloc[0]
+            price = to_float(r.get("最新价"))
+            chg = to_float(r.get("涨跌额"))
+            pct = to_float(r.get("涨跌幅"))
+            color = color_of(chg)
+            price_txt = f"{price:,.2f}" if price is not None else "--"
+            chg_txt = f"{chg:+.2f}" if chg is not None else "--"
+            pct_txt = f"{pct:+.2f}%" if pct is not None else "--"
+            col.markdown(
+                f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:12px 14px;background:#fff">
+<div style="color:#555;font-size:0.92rem">{label} <span style="color:#999">{code}</span></div>
+<div style="color:{color};font-size:1.55rem;font-weight:700;line-height:1.4">{price_txt}</div>
+<div style="color:{color};font-size:0.92rem">{chg_txt}　{pct_txt}</div>
+</div>""",
+                unsafe_allow_html=True,
+            )
+
+
+def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
+                      period_label: str, range_label: str) -> None:
+    row = spot[spot["代码"] == code] if not spot.empty else spot.iloc[0:0]
+    name = str(row.iloc[0]["名称"]) if not row.empty else ""
+    price = to_float(row.iloc[0].get("最新价")) if not row.empty else None
+    chg = to_float(row.iloc[0].get("涨跌额")) if not row.empty else None
+    pct = to_float(row.iloc[0].get("涨跌幅")) if not row.empty else None
+    prev_close = to_float(row.iloc[0].get("昨收")) if not row.empty else None
+
+    with col:
+        with st.container(border=True):
+            color = color_of(chg)
+            price_txt = f"{price:.2f}" if price is not None else "--"
+            pct_txt = f"{pct:+.2f}%" if pct is not None else "--"
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
+                f"<span style='font-weight:600'>{name or '未知股票'}</span>"
+                f"<span style='color:#999;font-size:0.8rem'>{code}</span></div>"
+                f"<div style='color:{color};font-size:1.1rem;font-weight:600'>"
+                f"{price_txt}　{pct_txt}</div>",
+                unsafe_allow_html=True,
+            )
+            try:
+                if chart_type == "分时":
+                    df = get_intraday(code)
+                    fig = make_intraday_fig(df, prev_close, height=280, compact=True) if not df.empty else None
+                else:
+                    df = load_kline(code, period_label, range_label)
+                    fig = make_kline_fig(df, height=280, compact=True) if not df.empty else None
+                if fig is None:
+                    st.caption("暂无数据")
+                else:
+                    st.plotly_chart(
+                        fig, width="stretch", key=f"mini_{code}",
+                        config={"displayModeBar": False},
+                    )
+            except Exception as exc:
+                st.caption(f"数据获取失败：{exc}")
+
+            b1, b2 = st.columns(2)
+            if b1.button("放大", key=f"zoom_{code}", width="stretch"):
+                show_enlarged(code, name, chart_type, period_label, range_label, prev_close)
+            if b2.button("删除", key=f"del_{code}", width="stretch"):
+                remove_from_watchlist(code)
+                st.rerun()
 
 
 def main() -> None:
     st.title("📈 股票行情助手")
 
     try:
-        spot = get_index_spot()
-        render_index_cards(spot)
+        index_spot = get_index_spot()
+        render_index_cards(index_spot)
         st.caption(f"大盘指数更新于 {dt.datetime.now():%H:%M:%S}　数据来源：AKShare")
     except Exception as exc:
         st.warning(f"大盘指数获取失败：{exc}")
 
     st.divider()
 
-    c1, c2, c3 = st.columns([2.2, 1, 1])
-    with c1:
-        raw_code = st.text_input("股票代码", value="600519", help="6 位 A 股代码，如 600519、000001")
-    with c2:
-        period_label = st.selectbox("K线周期", list(PERIODS.keys()))
-    with c3:
-        range_label = st.selectbox("时间范围", list(RANGES.keys()), index=2)
+    if "watchlist" not in st.session_state:
+        st.session_state.watchlist = load_watchlist()
 
-    code = normalize_code(raw_code)
-    if not code:
-        st.info("请输入 6 位 A 股代码，例如 600519。")
+    try:
+        stock_index = get_stock_index()
+    except Exception as exc:
+        stock_index = pd.DataFrame(columns=["代码", "名称", "首字母"])
+        st.warning(f"股票列表获取失败，暂时只能按代码添加：{exc}")
+
+    try:
+        spot = get_a_spot()
+    except Exception as exc:
+        spot = pd.DataFrame()
+        st.caption(f"个股快照获取失败：{exc}")
+
+    st.subheader("自选看板")
+
+    a1, a2, a3 = st.columns([2.4, 2.4, 1])
+    query = a1.text_input(
+        "添加自选", placeholder="输入代码或名称首字母，如 600519 / gzmt", key="add_query"
+    )
+    matches = resolve_stocks(query, stock_index)
+    labels = [f"{c}　{n}" if n else c for c, n in matches[:30]]
+    picked_idx = None
+    if labels:
+        picked = a2.selectbox("匹配结果", labels, key="add_pick")
+        picked_idx = labels.index(picked)
+    elif query.strip():
+        a2.caption("无匹配股票")
+    else:
+        a2.caption("输入后从匹配结果中选择")
+    if a3.button("添加", type="primary", width="stretch",
+                 disabled=picked_idx is None, key="add_btn"):
+        code = matches[picked_idx][0]
+        if code in st.session_state.watchlist:
+            st.toast("已在自选看板中")
+        else:
+            add_to_watchlist(code)
+            st.toast("已添加到自选看板")
+
+    c1, c2, c3 = st.columns([1.4, 1, 1])
+    chart_type = c1.radio("图表类型", ["K线", "分时"], horizontal=True)
+    if chart_type == "K线":
+        period_label = c2.selectbox("K线周期", list(PERIODS.keys()))
+        range_label = c3.selectbox("时间范围", list(RANGES.keys()), index=2)
+    else:
+        period_label, range_label = "日K", "1年"
+
+    codes = st.session_state.watchlist
+    if not codes:
+        st.info("自选看板为空：在上方输入代码或名称首字母，选择匹配结果后点击「添加」。")
         return
 
-    with st.spinner("加载行情数据…"):
-        info = render_stock_header(code)
-
-    tab_kline, tab_intraday = st.tabs(["K线图", "分时图"])
-
-    with tab_kline:
-        days = RANGES[range_label]
-        today = dt.date.today()
-        start = "19900101" if days is None else (today - dt.timedelta(days=days)).strftime("%Y%m%d")
-        end = today.strftime("%Y%m%d")
-        try:
-            kdf = get_kline(code, PERIODS[period_label], start, end)
-        except Exception as exc:
-            kdf = pd.DataFrame()
-            st.error(f"K线数据获取失败：{exc}")
-        if kdf.empty:
-            st.info("暂无 K 线数据（请检查代码是否正确）。")
-        else:
-            heading = info.get("名称") or code
-            st.plotly_chart(
-                make_kline_fig(kdf, f"{heading}（{code}）　{period_label}"),
-                width="stretch",
-            )
-            st.caption(f"共 {len(kdf)} 根 K 线，前复权，数据来源：新浪财经")
-
-    with tab_intraday:
-        try:
-            idf = get_intraday(code)
-        except Exception as exc:
-            idf = pd.DataFrame()
-            st.error(f"分时数据获取失败：{exc}")
-        if idf.empty:
-            st.info("暂无分时数据（可能为非交易日或停牌）。")
-        else:
-            prev_close = to_float(info.get("昨收"))
-            if prev_close is None and len(idf) > 1:
-                prev_close = to_float(idf["开盘"].iloc[0])
-            heading = info.get("名称") or code
-            day = idf["时间"].dt.strftime("%Y-%m-%d").iloc[-1]
-            st.plotly_chart(
-                make_intraday_fig(idf, prev_close, f"{heading}（{code}）　分时 {day}"),
-                width="stretch",
-            )
-            st.caption("数据来源：新浪财经，按 1 分钟聚合")
+    with st.spinner("加载自选图表…"):
+        for i in range(0, len(codes), 4):
+            cols = st.columns(4)
+            for col, code in zip(cols, codes[i:i + 4]):
+                render_watch_card(col, code, spot, chart_type, period_label, range_label)
 
 
 if __name__ == "__main__":
