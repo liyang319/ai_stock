@@ -39,6 +39,11 @@ PERIODS = {"日K": "daily", "周K": "weekly", "月K": "monthly"}
 RANGES = {"3个月": 90, "6个月": 180, "1年": 365, "3年": 1095, "全部": None}
 REFRESH_OPTIONS = {"关闭": 0, "15秒": 15, "30秒": 30, "60秒": 60}
 
+MA_PERIODS = (5, 10, 20, 30)
+# 通达信/同花顺习惯：5日白、10日黄、20日紫、30日绿（白底上 5日 用灰色替代）
+MA_COLORS = {5: "#9e9e9e", 10: "#e6a700", 20: "#d000d0", 30: "#00a651"}
+PERIOD_UNITS = {"日K": "日", "周K": "周", "月K": "月"}
+
 WATCHLIST_FILE = Path(
     os.environ.get("WATCHLIST_FILE", Path(__file__).with_name("watchlist.json"))
 )
@@ -249,7 +254,11 @@ def resolve_stocks(query: str, index_df: pd.DataFrame) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------- 图表
 
 def make_kline_fig(df: pd.DataFrame, title: str = "", height: int = 620,
-                   compact: bool = False) -> go.Figure:
+                   compact: bool = False, unit: str = "日") -> go.Figure:
+    df = df.copy()
+    for n in MA_PERIODS:
+        df[f"MA{n}"] = df["收盘"].rolling(n).mean()
+
     vol_colors = np.where(df["收盘"] >= df["开盘"], UP_COLOR, DOWN_COLOR)
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
@@ -264,6 +273,14 @@ def make_kline_fig(df: pd.DataFrame, title: str = "", height: int = 620,
         ),
         row=1, col=1,
     )
+    for n in MA_PERIODS:
+        fig.add_trace(
+            go.Scatter(
+                x=df["日期"], y=df[f"MA{n}"], name=f"{n}{unit}",
+                mode="lines", line=dict(color=MA_COLORS[n], width=1.1),
+            ),
+            row=1, col=1,
+        )
     fig.add_trace(
         go.Bar(x=df["日期"], y=df["成交量"], name="成交量", marker_color=vol_colors),
         row=2, col=1,
@@ -366,7 +383,10 @@ def show_enlarged(code: str, name: str, chart_type: str,
             if df.empty:
                 st.info("暂无 K 线数据。")
                 return
-            fig = make_kline_fig(df, f"{heading}　{period_label}", height=640)
+            fig = make_kline_fig(
+                df, f"{heading}　{period_label}", height=640,
+                unit=PERIOD_UNITS[period_label],
+            )
     except Exception as exc:
         st.error(f"图表数据获取失败：{exc}")
         return
@@ -401,6 +421,15 @@ def render_index_cards(spot: pd.DataFrame) -> None:
             )
 
 
+def ma_legend_html(unit: str) -> str:
+    items = "".join(
+        f"<span style='color:{MA_COLORS[n]}'>●</span>"
+        f"<span style='color:#666;margin:0 10px 0 3px'>{n}{unit}</span>"
+        for n in MA_PERIODS
+    )
+    return f"<div style='font-size:0.72rem;line-height:1.4;margin-left:2px'>{items}</div>"
+
+
 def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
                       period_label: str, range_label: str) -> None:
     row = spot[spot["代码"] == code] if not spot.empty else spot.iloc[0:0]
@@ -429,7 +458,9 @@ def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
                     fig = make_intraday_fig(df, prev_close, height=280, compact=True) if not df.empty else None
                 else:
                     df = load_kline(code, period_label, range_label)
-                    fig = make_kline_fig(df, height=280, compact=True) if not df.empty else None
+                    fig = make_kline_fig(
+                        df, height=280, compact=True, unit=PERIOD_UNITS[period_label]
+                    ) if not df.empty else None
                 if fig is None:
                     st.caption("暂无数据")
                 else:
@@ -437,6 +468,11 @@ def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
                         fig, width="stretch", key=f"mini_{code}",
                         config={"displayModeBar": False},
                     )
+                    if chart_type == "K线":
+                        st.markdown(
+                            ma_legend_html(PERIOD_UNITS[period_label]),
+                            unsafe_allow_html=True,
+                        )
             except Exception as exc:
                 st.caption(f"数据获取失败：{exc}")
 
