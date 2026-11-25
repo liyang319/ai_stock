@@ -11,6 +11,7 @@ import html
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import akshare as ak
@@ -231,9 +232,44 @@ def get_fund_flow() -> pd.DataFrame:
     df["换手率"] = pd.to_numeric(
         df["换手率"].astype(str).str.rstrip("%"), errors="coerce"
     )
-    for col in ("流入资金", "流出资金", "净额"):
+    df["涨跌幅"] = pd.to_numeric(
+        df["涨跌幅"].astype(str).str.rstrip("%"), errors="coerce"
+    )
+    for col in ("流入资金", "流出资金", "净额", "成交额"):
         df[col] = df[col].map(parse_cn_amount)
-    return df[["代码", "换手率", "流入资金", "流出资金", "净额"]]
+    return df[["代码", "换手率", "涨跌幅", "流入资金", "流出资金", "净额", "成交额"]]
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_hsgt_summary() -> pd.DataFrame:
+    """沪深港通资金流汇总（东财 datacenter）：南北向净买额与涨跌家数。"""
+    df = ak.stock_hsgt_fund_flow_summary_em().copy()
+    for col in ("成交净买额", "资金净流入", "上涨数", "持平数", "下跌数", "指数涨跌幅"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def collect_main_fund_tiers():
+    """东方财富大盘分级资金流（主力/超大单/大单/中单/小单），限流时静默降级。"""
+    last_fail = st.session_state.get("em_flow_fail_ts", 0.0)
+    if time.time() - last_fail < 600:
+        return None
+    try:
+        df = ak.stock_market_fund_flow()
+        last = df.iloc[-1]
+        mapping = {
+            "主力净流入-净额": "主力",
+            "超大单净流入-净额": "超大单",
+            "大单净流入-净额": "大单",
+            "中单净流入-净额": "中单",
+            "小单净流入-净额": "小单",
+        }
+        tiers = {label: float(last[col]) for col, label in mapping.items() if col in df.columns}
+        return tiers or None
+    except Exception:
+        st.session_state["em_flow_fail_ts"] = time.time()
+        return None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -664,6 +700,21 @@ def compute_market_breadth(spot: pd.DataFrame):
     }
 
 
+def compute_breadth_from_flow(flow: pd.DataFrame):
+    """按同花顺沪深 A 股列表统计涨跌家数（口径与同花顺等软件一致，不含北交所）。"""
+    if flow is None or flow.empty or "涨跌幅" not in flow.columns:
+        return None
+    pct = pd.to_numeric(flow["涨跌幅"], errors="coerce").dropna()
+    if pct.empty:
+        return None
+    return {
+        "up": int((pct > 0).sum()),
+        "down": int((pct < 0).sum()),
+        "flat": int((pct == 0).sum()),
+        "total": int(pct.size),
+    }
+
+
 def collect_index_snapshot() -> dict:
     errors = []
     try:
@@ -679,23 +730,16 @@ def collect_index_snapshot() -> dict:
 
     breadth = None
     market_amount = None
-    try:
-        a_spot = get_a_spot()
-        breadth = compute_market_breadth(a_spot)
-        if not a_spot.empty and "成交额" in a_spot.columns:
-            amount = pd.to_numeric(a_spot["成交额"], errors="coerce").fillna(0)
-            if "成交量" in a_spot.columns:
-                active = pd.to_numeric(a_spot["成交量"], errors="coerce").fillna(0) > 0
-                amount = amount[active]
-            total_amount = float(amount.sum())
-            market_amount = total_amount if total_amount > 0 else None
-    except Exception as exc:
-        errors.append(f"A股涨跌家数/成交额获取失败：{exc}")
-
     flow_agg = None
+    breadth_source = "同花顺"
     try:
         fund_flow = get_fund_flow()
         if not fund_flow.empty:
+            breadth = compute_breadth_from_flow(fund_flow)
+            amount_sum = float(
+                pd.to_numeric(fund_flow["成交额"], errors="coerce").fillna(0).sum()
+            )
+            market_amount = amount_sum if amount_sum > 0 else None
             flow_agg = {
                 "inflow": float(pd.to_numeric(fund_flow["流入资金"], errors="coerce").fillna(0).sum()),
                 "outflow": float(pd.to_numeric(fund_flow["流出资金"], errors="coerce").fillna(0).sum()),
@@ -704,12 +748,49 @@ def collect_index_snapshot() -> dict:
     except Exception as exc:
         errors.append(f"市场资金流获取失败：{exc}")
 
+    if breadth is None:  # 同花顺不可用时回退新浪口径
+        breadth_source = "新浪"
+        try:
+            a_spot = get_a_spot()
+            breadth = compute_market_breadth(a_spot)
+            if not a_spot.empty and "成交额" in a_spot.columns:
+                amount = pd.to_numeric(a_spot["成交额"], errors="coerce").fillna(0)
+                if "成交量" in a_spot.columns:
+                    active = pd.to_numeric(a_spot["成交量"], errors="coerce").fillna(0) > 0
+                    amount = amount[active]
+                total_amount = float(amount.sum())
+                market_amount = total_amount if total_amount > 0 else None
+        except Exception as exc:
+            errors.append(f"A股涨跌家数/成交额获取失败：{exc}")
+
+    hsgt = None
+    try:
+        summary = get_hsgt_summary()
+        if not summary.empty:
+            north = summary[summary["资金方向"] == "北向"]
+            south = summary[summary["资金方向"] == "南向"]
+            # 汇总接口的净买额单位为亿元，统一换算为元
+            north_net = float(north["成交净买额"].fillna(0).sum()) * 1e8
+            south_net = float(south["成交净买额"].fillna(0).sum()) * 1e8
+            hsgt = {
+                "north_net": north_net,
+                "north_disclosed": north_net != 0,
+                "south_net": south_net,
+            }
+    except Exception as exc:
+        errors.append(f"沪深港通资金流获取失败：{exc}")
+
+    main_flow = collect_main_fund_tiers()
+
     return {
         "index_spot": index_spot,
         "global_spot": global_spot,
         "breadth": breadth,
+        "breadth_source": breadth_source,
         "market_amount": market_amount,
         "flow_agg": flow_agg,
+        "hsgt": hsgt,
+        "main_flow": main_flow,
         "updated": dt.datetime.now(),
         "errors": errors,
     }
@@ -809,12 +890,14 @@ def refresh_snapshots() -> None:
         run_enabled_strategies(snapshot)
 
 
-def render_market_breadth(breadth: dict, market_amount, flow_agg) -> None:
+def render_market_breadth(breadth: dict, market_amount, flow_agg,
+                          breadth_source: str, hsgt, main_flow) -> None:
     up, down, flat = breadth["up"], breadth["down"], breadth["flat"]
     total = breadth["total"] or 1
     up_w = up / total * 100
     down_w = down / total * 100
     amount_txt = fmt_amount(market_amount) if market_amount else "--"
+    scope = "同花顺口径·沪深A股" if breadth_source == "同花顺" else "新浪口径"
 
     flow_html = ""
     if flow_agg:
@@ -831,10 +914,50 @@ def render_market_breadth(breadth: dict, market_amount, flow_agg) -> None:
             "</div>"
         )
 
+    parts = []
+    if hsgt:
+        if hsgt.get("north_disclosed"):
+            parts.append(
+                "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>北向资金 "
+                f"<span style='color:{color_of(hsgt['north_net'])};font-weight:600'>"
+                f"{fmt_amount(hsgt['north_net'], signed=True)}</span></span>"
+            )
+        else:
+            parts.append(
+                "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>北向资金 "
+                "<span style='color:#999'>净买入已停止实时披露（2024-08 起）</span></span>"
+            )
+        parts.append(
+            "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>南向资金 "
+            f"<span style='color:{color_of(hsgt['south_net'])};font-weight:600'>"
+            f"{fmt_amount(hsgt['south_net'], signed=True)}</span></span>"
+        )
+    if main_flow:
+        for name in ("主力", "超大单", "大单", "中单", "小单"):
+            value = main_flow.get(name)
+            if value is None:
+                continue
+            parts.append(
+                f"<span style='color:#888;font-size:0.88rem;white-space:nowrap'>{name}净流入 "
+                f"<span style='color:{color_of(value)};font-weight:600'>"
+                f"{fmt_amount(value, signed=True)}</span></span>"
+            )
+    else:
+        parts.append(
+            "<span style='color:#aaa;font-size:0.82rem;white-space:nowrap'>"
+            "主力分级资金暂不可用（数据源限流）</span>"
+        )
+    money_html = (
+        "<div style='display:flex;align-items:center;gap:18px;flex-wrap:wrap'>"
+        "<span style='color:#555;font-size:0.92rem;white-space:nowrap'>资金流向</span>"
+        + "".join(parts) + "</div>"
+    )
+
     st.markdown(
         f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:10px 14px;background:#fff;display:flex;flex-direction:column;gap:6px;margin-top:6px">
 <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
-<span style="color:#555;font-size:0.92rem;white-space:nowrap">A股涨跌家数</span>
+<span style="color:#555;font-size:0.92rem;white-space:nowrap">沪深A股涨跌家数
+<span style="color:#bbb;font-size:0.75rem">（{scope}）</span></span>
 <span style="color:{UP_COLOR};font-weight:600;white-space:nowrap">上涨 {up:,} 家</span>
 <span style="color:{FLAT_COLOR};white-space:nowrap">平盘 {flat:,} 家</span>
 <span style="color:{DOWN_COLOR};font-weight:600;white-space:nowrap">下跌 {down:,} 家</span>
@@ -847,6 +970,7 @@ def render_market_breadth(breadth: dict, market_amount, flow_agg) -> None:
 <span style="color:#999;font-size:0.78rem;white-space:nowrap">共 {total:,} 只</span>
 </div>
 {flow_html}
+{money_html}
 </div>""",
         unsafe_allow_html=True,
     )
@@ -874,7 +998,12 @@ def render_index_panel() -> None:
     breadth = snapshot.get("breadth")
     if breadth:
         render_market_breadth(
-            breadth, snapshot.get("market_amount"), snapshot.get("flow_agg")
+            breadth,
+            snapshot.get("market_amount"),
+            snapshot.get("flow_agg"),
+            snapshot.get("breadth_source", "同花顺"),
+            snapshot.get("hsgt"),
+            snapshot.get("main_flow"),
         )
 
     errors = snapshot.get("errors") or []
