@@ -24,6 +24,9 @@ from pypinyin import Style, lazy_pinyin
 from streamlit_sortables import sort_items
 
 import strategies
+import strategy_dual_ma
+import strategy_macd
+import strategy_rsi
 
 st.set_page_config(page_title="股票行情助手", page_icon="📈", layout="wide")
 
@@ -40,8 +43,14 @@ INDEXES = [
 ]
 
 QUANT_STRATEGIES = strategies.STRATEGY_NAMES
-DUAL_MA_KEY = f"strategy_{QUANT_STRATEGIES.index('双均线交叉')}"
-DUAL_MA_QUANTITY = 1000
+SIGNAL_QUANTITY = 1000
+
+# 已实现的策略：名称 -> 信号函数；勾选后按此注册表计算
+STRATEGY_RUNNERS = {
+    "双均线交叉": strategy_dual_ma.dual_ma_signal,
+    "MACD 金叉死叉": strategy_macd.macd_signal,
+    "RSI 超买超卖": strategy_rsi.rsi_signal,
+}
 
 # (接口类型, AKShare 代码, 显示代码, 显示名称)
 GLOBAL_INDEXES = [
@@ -206,7 +215,7 @@ def get_index_spot() -> pd.DataFrame:
         df = pd.concat(frames, ignore_index=True)
         df["代码"] = df["代码"].astype(str).map(normalize_code)
 
-    for col in ("最新价", "涨跌额", "涨跌幅"):
+    for col in ("最新价", "涨跌额", "涨跌幅", "成交量", "成交额"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -728,30 +737,47 @@ def collect_index_snapshot() -> dict:
         global_spot = pd.DataFrame()
         errors.append(f"全球指数获取失败：{exc}")
 
-    breadth = None
+    # 两市成交额优先取指数口径（上证指数 + 深证综指），与交易软件一致
     market_amount = None
     market_amount_sh = None
     market_amount_sz = None
+
+    def _index_amount(code: str):
+        if index_spot is None or index_spot.empty or "成交额" not in index_spot.columns:
+            return None
+        row = index_spot[index_spot["代码"] == code]
+        if row.empty:
+            return None
+        value = to_float(row.iloc[0].get("成交额"))
+        return value if value and value > 0 else None
+
+    market_amount_sh = _index_amount("000001")
+    market_amount_sz = _index_amount("399106") or _index_amount("399001")
+    if market_amount_sh and market_amount_sz:
+        market_amount = market_amount_sh + market_amount_sz
+
+    breadth = None
     flow_agg = None
     breadth_source = "同花顺"
     try:
         fund_flow = get_fund_flow()
         if not fund_flow.empty:
             breadth = compute_breadth_from_flow(fund_flow)
-            amounts = pd.to_numeric(fund_flow["成交额"], errors="coerce").fillna(0)
-            amount_sum = float(amounts.sum())
-            market_amount = amount_sum if amount_sum > 0 else None
-            flow_codes = fund_flow["代码"].astype(str)
-            sh_amount = float(amounts[flow_codes.str.startswith("6")].sum())
-            if sh_amount > 0:
-                market_amount_sh = sh_amount
-                sz_amount = amount_sum - sh_amount
-                market_amount_sz = sz_amount if sz_amount > 0 else None
             flow_agg = {
                 "inflow": float(pd.to_numeric(fund_flow["流入资金"], errors="coerce").fillna(0).sum()),
                 "outflow": float(pd.to_numeric(fund_flow["流出资金"], errors="coerce").fillna(0).sum()),
                 "net": float(pd.to_numeric(fund_flow["净额"], errors="coerce").fillna(0).sum()),
             }
+            if market_amount is None:  # 指数成交额不可用时回退为个股成交额加总
+                amounts = pd.to_numeric(fund_flow["成交额"], errors="coerce").fillna(0)
+                amount_sum = float(amounts.sum())
+                market_amount = amount_sum if amount_sum > 0 else None
+                flow_codes = fund_flow["代码"].astype(str)
+                sh_amount = float(amounts[flow_codes.str.startswith("6")].sum())
+                if sh_amount > 0:
+                    market_amount_sh = sh_amount
+                    sz_amount = amount_sum - sh_amount
+                    market_amount_sz = sz_amount if sz_amount > 0 else None
     except Exception as exc:
         errors.append(f"市场资金流获取失败：{exc}")
 
@@ -760,15 +786,8 @@ def collect_index_snapshot() -> dict:
         try:
             a_spot = get_a_spot()
             breadth = compute_market_breadth(a_spot)
-            if not a_spot.empty and "成交额" in a_spot.columns:
-                amount = pd.to_numeric(a_spot["成交额"], errors="coerce").fillna(0)
-                if "成交量" in a_spot.columns:
-                    active = pd.to_numeric(a_spot["成交量"], errors="coerce").fillna(0) > 0
-                    amount = amount[active]
-                total_amount = float(amount.sum())
-                market_amount = total_amount if total_amount > 0 else None
         except Exception as exc:
-            errors.append(f"A股涨跌家数/成交额获取失败：{exc}")
+            errors.append(f"A股涨跌家数获取失败：{exc}")
 
     hsgt = None
     try:
@@ -853,40 +872,43 @@ def ensure_watch_snapshot(chart_type: str, period_label: str, range_label: str) 
 
 def run_enabled_strategies(snapshot: dict) -> None:
     """对已勾选的策略实时计算自选股信号，命中后写入系统日志（带策略专属颜色）。"""
-    if not st.session_state.get(DUAL_MA_KEY):
-        return
     codes = list(st.session_state.get("watchlist", []))
     if not codes:
         return
-    strategy = "双均线交叉"
-    color = strategies.STRATEGY_COLORS[strategy]
     spot = snapshot.get("spot", pd.DataFrame())
+    names = {}
+    if not spot.empty:
+        names = dict(zip(spot["代码"].astype(str), spot["名称"].astype(str)))
     seen = st.session_state.setdefault("strategy_signal_keys", set())
-    for code in codes:
-        stock_name = code
-        if not spot.empty:
-            row = spot[spot["代码"] == code]
-            if not row.empty:
-                stock_name = str(row.iloc[0]["名称"])
+
+    for strategy, signal_fn in STRATEGY_RUNNERS.items():
         try:
-            daily = load_kline(code, "日K", "6个月")
-            action = strategies.dual_ma_signal(daily)
-        except Exception:
+            idx = QUANT_STRATEGIES.index(strategy)
+        except ValueError:
             continue
-        if action is None or daily.empty:
+        if not st.session_state.get(f"strategy_{idx}"):
             continue
-        bar_date = pd.to_datetime(daily["日期"].iloc[-1]).strftime("%Y-%m-%d")
-        signal_key = f"{strategy}-{code}-{action}-{bar_date}"
-        if signal_key in seen:
-            continue
-        seen.add(signal_key)
-        add_log(
-            strategies.format_signal_log(
-                strategy, stock_name, action,
-                DUAL_MA_QUANTITY, dt.datetime.now().strftime("%H:%M:%S"),
-            ),
-            color=color,
-        )
+        color = strategies.STRATEGY_COLORS.get(strategy)
+        for code in codes:
+            try:
+                daily = load_kline(code, "日K", "6个月")
+                action = signal_fn(daily)
+            except Exception:
+                continue
+            if action is None or daily.empty:
+                continue
+            bar_date = pd.to_datetime(daily["日期"].iloc[-1]).strftime("%Y-%m-%d")
+            signal_key = f"{strategy}-{code}-{action}-{bar_date}"
+            if signal_key in seen:
+                continue
+            seen.add(signal_key)
+            add_log(
+                strategies.format_signal_log(
+                    strategy, names.get(code, code), action,
+                    SIGNAL_QUANTITY, dt.datetime.now().strftime("%H:%M:%S"),
+                ),
+                color=color,
+            )
 
 
 def refresh_snapshots() -> None:
