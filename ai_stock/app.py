@@ -24,9 +24,18 @@ from pypinyin import Style, lazy_pinyin
 from streamlit_sortables import sort_items
 
 import strategies
+import strategy_bollinger
 import strategy_dual_ma
+import strategy_grid
 import strategy_macd
+import strategy_mean_reversion
+import strategy_momentum
+import strategy_multifactor
+import strategy_pairs
+import strategy_pv_divergence
 import strategy_rsi
+import strategy_trend
+import strategy_turtle
 
 st.set_page_config(page_title="股票行情助手", page_icon="📈", layout="wide")
 
@@ -50,6 +59,15 @@ STRATEGY_RUNNERS = {
     "双均线交叉": strategy_dual_ma.dual_ma_signal,
     "MACD 金叉死叉": strategy_macd.macd_signal,
     "RSI 超买超卖": strategy_rsi.rsi_signal,
+    "布林带突破": strategy_bollinger.bollinger_signal,
+    "动量轮动": strategy_momentum.momentum_signal,
+    "均值回归": strategy_mean_reversion.mean_reversion_signal,
+    "网格交易": strategy_grid.grid_signal,
+    "海龟交易法则": strategy_turtle.turtle_signal,
+    "量价背离": strategy_pv_divergence.pv_divergence_signal,
+    "多因子选股": strategy_multifactor.multifactor_signal,
+    "趋势跟踪": strategy_trend.trend_signal,
+    "配对交易": strategy_pairs.pairs_signal,
 }
 
 # (接口类型, AKShare 代码, 显示代码, 显示名称)
@@ -1089,12 +1107,29 @@ def render_system_log_panel() -> None:
             st.markdown("".join(rows), unsafe_allow_html=True)
 
 
+def _toggle_all_strategies() -> None:
+    value = bool(st.session_state.get("select_all_strategies"))
+    for i in range(len(QUANT_STRATEGIES)):
+        st.session_state[f"strategy_{i}"] = value
+
+
 @st.fragment
 def render_quant_strategy_box() -> None:
     """独立 fragment：勾选策略只重跑本区域，不触发整页重跑（避免全页发白）。"""
     with st.container(border=True, key="quant_strategies"):
         st.subheader("量化策略")
         st.caption("勾选需要关注的策略（双均线交叉已接入，其余算法待实现）")
+        all_selected = all(
+            st.session_state.get(f"strategy_{i}", False)
+            for i in range(len(QUANT_STRATEGIES))
+        )
+        # 全选框状态与各策略勾选情况保持一致
+        st.session_state["select_all_strategies"] = all_selected
+        st.checkbox(
+            "全选",
+            key="select_all_strategies",
+            on_change=_toggle_all_strategies,
+        )
         per_row = 4
         for start in range(0, len(QUANT_STRATEGIES), per_row):
             names = QUANT_STRATEGIES[start:start + per_row]
