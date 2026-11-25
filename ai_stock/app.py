@@ -22,6 +22,8 @@ from plotly.subplots import make_subplots
 from pypinyin import Style, lazy_pinyin
 from streamlit_sortables import sort_items
 
+import strategies
+
 st.set_page_config(page_title="股票行情助手", page_icon="📈", layout="wide")
 
 UP_COLOR = "#e5333c"      # 中国习惯：红涨
@@ -36,20 +38,9 @@ INDEXES = [
     ("000688", "科创50"),
 ]
 
-QUANT_STRATEGIES = [
-    "双均线交叉",
-    "MACD 金叉死叉",
-    "RSI 超买超卖",
-    "布林带突破",
-    "动量轮动",
-    "均值回归",
-    "网格交易",
-    "海龟交易法则",
-    "量价背离",
-    "多因子选股",
-    "趋势跟踪",
-    "配对交易",
-]
+QUANT_STRATEGIES = strategies.STRATEGY_NAMES
+DUAL_MA_KEY = f"strategy_{QUANT_STRATEGIES.index('双均线交叉')}"
+DUAL_MA_QUANTITY = 1000
 
 # (接口类型, AKShare 代码, 显示代码, 显示名称)
 GLOBAL_INDEXES = [
@@ -165,14 +156,17 @@ def save_watchlist(codes: list[str]) -> None:
         st.warning(f"自选列表保存失败：{exc}")
 
 
-def add_log(message: str, level: str = "info") -> None:
-    """记录系统日志。量化算法产生信号后可直接调用此函数写入提示。"""
+def add_log(message: str, level: str = "info", color: str | None = None) -> None:
+    """记录系统日志。量化算法产生信号后可直接调用此函数写入提示，color 指定标识色。"""
     logs = st.session_state.setdefault("system_logs", [])
-    logs.append({
+    entry = {
         "time": dt.datetime.now().strftime("%H:%M:%S"),
         "level": level,
         "message": message,
-    })
+    }
+    if color:
+        entry["color"] = color
+    logs.append(entry)
     del logs[:-LOG_MAX_ENTRIES]
 
 
@@ -682,15 +676,40 @@ def collect_index_snapshot() -> dict:
     except Exception as exc:
         global_spot = pd.DataFrame()
         errors.append(f"全球指数获取失败：{exc}")
+
     breadth = None
+    market_amount = None
     try:
-        breadth = compute_market_breadth(get_a_spot())
+        a_spot = get_a_spot()
+        breadth = compute_market_breadth(a_spot)
+        if not a_spot.empty and "成交额" in a_spot.columns:
+            amount = pd.to_numeric(a_spot["成交额"], errors="coerce").fillna(0)
+            if "成交量" in a_spot.columns:
+                active = pd.to_numeric(a_spot["成交量"], errors="coerce").fillna(0) > 0
+                amount = amount[active]
+            total_amount = float(amount.sum())
+            market_amount = total_amount if total_amount > 0 else None
     except Exception as exc:
-        errors.append(f"A股涨跌家数获取失败：{exc}")
+        errors.append(f"A股涨跌家数/成交额获取失败：{exc}")
+
+    flow_agg = None
+    try:
+        fund_flow = get_fund_flow()
+        if not fund_flow.empty:
+            flow_agg = {
+                "inflow": float(pd.to_numeric(fund_flow["流入资金"], errors="coerce").fillna(0).sum()),
+                "outflow": float(pd.to_numeric(fund_flow["流出资金"], errors="coerce").fillna(0).sum()),
+                "net": float(pd.to_numeric(fund_flow["净额"], errors="coerce").fillna(0).sum()),
+            }
+    except Exception as exc:
+        errors.append(f"市场资金流获取失败：{exc}")
+
     return {
         "index_spot": index_spot,
         "global_spot": global_spot,
         "breadth": breadth,
+        "market_amount": market_amount,
+        "flow_agg": flow_agg,
         "updated": dt.datetime.now(),
         "errors": errors,
     }
@@ -742,21 +761,79 @@ def ensure_watch_snapshot(chart_type: str, period_label: str, range_label: str) 
         )
 
 
+def run_enabled_strategies(snapshot: dict) -> None:
+    """对已勾选的策略实时计算自选股信号，命中后写入系统日志（带策略专属颜色）。"""
+    if not st.session_state.get(DUAL_MA_KEY):
+        return
+    codes = list(st.session_state.get("watchlist", []))
+    if not codes:
+        return
+    strategy = "双均线交叉"
+    color = strategies.STRATEGY_COLORS[strategy]
+    spot = snapshot.get("spot", pd.DataFrame())
+    seen = st.session_state.setdefault("strategy_signal_keys", set())
+    for code in codes:
+        stock_name = code
+        if not spot.empty:
+            row = spot[spot["代码"] == code]
+            if not row.empty:
+                stock_name = str(row.iloc[0]["名称"])
+        try:
+            daily = load_kline(code, "日K", "6个月")
+            action = strategies.dual_ma_signal(daily)
+        except Exception:
+            continue
+        if action is None or daily.empty:
+            continue
+        bar_date = pd.to_datetime(daily["日期"].iloc[-1]).strftime("%Y-%m-%d")
+        signal_key = f"{strategy}-{code}-{action}-{bar_date}"
+        if signal_key in seen:
+            continue
+        seen.add(signal_key)
+        add_log(
+            strategies.format_signal_log(
+                strategy, stock_name, action,
+                DUAL_MA_QUANTITY, dt.datetime.now().strftime("%H:%M:%S"),
+            ),
+            color=color,
+        )
+
+
 def refresh_snapshots() -> None:
     """不可见的定时刷新：耗时请求与可见渲染分离，避免刷新时整块区域发白卡顿。"""
     st.session_state["index_snapshot"] = collect_index_snapshot()
     params = st.session_state.get("panel_params")
     if params:
-        st.session_state["watch_snapshot"] = collect_watch_snapshot(*params)
+        snapshot = collect_watch_snapshot(*params)
+        st.session_state["watch_snapshot"] = snapshot
+        run_enabled_strategies(snapshot)
 
 
-def render_market_breadth(breadth: dict) -> None:
+def render_market_breadth(breadth: dict, market_amount, flow_agg) -> None:
     up, down, flat = breadth["up"], breadth["down"], breadth["flat"]
     total = breadth["total"] or 1
     up_w = up / total * 100
     down_w = down / total * 100
+    amount_txt = fmt_amount(market_amount) if market_amount else "--"
+
+    flow_html = ""
+    if flow_agg:
+        net_color = color_of(flow_agg["net"])
+        flow_html = (
+            "<div style='display:flex;align-items:center;gap:18px;flex-wrap:wrap'>"
+            "<span style='color:#555;font-size:0.92rem;white-space:nowrap'>市场资金</span>"
+            f"<span style='color:#888;font-size:0.88rem;white-space:nowrap'>流入 "
+            f"<span style='color:{UP_COLOR};font-weight:600'>{fmt_amount(flow_agg['inflow'])}</span></span>"
+            f"<span style='color:#888;font-size:0.88rem;white-space:nowrap'>流出 "
+            f"<span style='color:{DOWN_COLOR};font-weight:600'>{fmt_amount(flow_agg['outflow'])}</span></span>"
+            f"<span style='color:#888;font-size:0.88rem;white-space:nowrap'>净流入 "
+            f"<span style='color:{net_color};font-weight:600'>{fmt_amount(flow_agg['net'], signed=True)}</span></span>"
+            "</div>"
+        )
+
     st.markdown(
-        f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:10px 14px;background:#fff;display:flex;align-items:center;gap:18px;margin-top:6px">
+        f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:10px 14px;background:#fff;display:flex;flex-direction:column;gap:6px;margin-top:6px">
+<div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
 <span style="color:#555;font-size:0.92rem;white-space:nowrap">A股涨跌家数</span>
 <span style="color:{UP_COLOR};font-weight:600;white-space:nowrap">上涨 {up:,} 家</span>
 <span style="color:{FLAT_COLOR};white-space:nowrap">平盘 {flat:,} 家</span>
@@ -765,7 +842,11 @@ def render_market_breadth(breadth: dict) -> None:
 <div style="width:{up_w:.1f}%;background:{UP_COLOR}"></div>
 <div style="width:{down_w:.1f}%;background:{DOWN_COLOR}"></div>
 </div>
+<span style="color:#888;font-size:0.88rem;white-space:nowrap">两市成交额
+<span style="color:#333;font-weight:600">{amount_txt}</span></span>
 <span style="color:#999;font-size:0.78rem;white-space:nowrap">共 {total:,} 只</span>
+</div>
+{flow_html}
 </div>""",
         unsafe_allow_html=True,
     )
@@ -792,7 +873,9 @@ def render_index_panel() -> None:
 
     breadth = snapshot.get("breadth")
     if breadth:
-        render_market_breadth(breadth)
+        render_market_breadth(
+            breadth, snapshot.get("market_amount"), snapshot.get("flow_agg")
+        )
 
     errors = snapshot.get("errors") or []
     if errors:
@@ -810,7 +893,7 @@ def render_system_log_panel() -> None:
                 return
             rows = []
             for entry in reversed(logs[-60:]):
-                color = LOG_COLORS.get(entry["level"], "#9aa0a6")
+                color = entry.get("color") or LOG_COLORS.get(entry["level"], "#9aa0a6")
                 rows.append(
                     "<div style='display:flex;gap:8px;align-items:flex-start;"
                     "padding:6px 4px;border-bottom:1px dashed #ececec'>"
@@ -821,6 +904,33 @@ def render_system_log_panel() -> None:
                     f"word-break:break-all'>{html.escape(entry['message'])}</span></div>"
                 )
             st.markdown("".join(rows), unsafe_allow_html=True)
+
+
+@st.fragment
+def render_quant_strategy_box() -> None:
+    """独立 fragment：勾选策略只重跑本区域，不触发整页重跑（避免全页发白）。"""
+    with st.container(border=True, key="quant_strategies"):
+        st.subheader("量化策略")
+        st.caption("勾选需要关注的策略（双均线交叉已接入，其余算法待实现）")
+        for start in range(0, len(QUANT_STRATEGIES), 4):
+            cols = st.columns(4)
+            for col, idx in zip(cols, range(start, min(start + 4, len(QUANT_STRATEGIES)))):
+                col.checkbox(QUANT_STRATEGIES[idx], key=f"strategy_{idx}")
+        selected = [
+            QUANT_STRATEGIES[i] for i in range(len(QUANT_STRATEGIES))
+            if st.session_state.get(f"strategy_{i}")
+        ]
+        if selected:
+            chips = "　".join(
+                f"<span style='color:{strategies.STRATEGY_COLORS[name]}'>●</span>"
+                f"<span style='color:#555'> {name}</span>"
+                for name in selected
+            )
+            st.markdown(
+                f"<div style='font-size:0.85rem;color:#666'>"
+                f"已选择 {len(selected)} 个：{chips}</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> None:
@@ -928,19 +1038,7 @@ def main() -> None:
             st.caption("拖动下方标签可调整自选看板顺序")
             apply_sort_order(stock_index)
 
-    with st.container(border=True, key="quant_strategies"):
-        st.subheader("量化策略")
-        st.caption("勾选需要关注的策略（当前仅界面展示，算法待接入）")
-        for start in range(0, len(QUANT_STRATEGIES), 4):
-            cols = st.columns(4)
-            for col, idx in zip(cols, range(start, min(start + 4, len(QUANT_STRATEGIES)))):
-                col.checkbox(QUANT_STRATEGIES[idx], key=f"strategy_{idx}")
-        selected = [
-            QUANT_STRATEGIES[i] for i in range(len(QUANT_STRATEGIES))
-            if st.session_state.get(f"strategy_{i}")
-        ]
-        if selected:
-            st.caption(f"已选择 {len(selected)} 个：{'、'.join(selected)}")
+    render_quant_strategy_box()
 
     st.session_state["panel_params"] = (chart_type, period_label, range_label)
     ensure_watch_snapshot(chart_type, period_label, range_label)
