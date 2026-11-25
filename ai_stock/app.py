@@ -81,6 +81,36 @@ def color_of(value) -> str:
     return UP_COLOR if value > 0 else DOWN_COLOR if value < 0 else FLAT_COLOR
 
 
+def parse_cn_amount(value):
+    """解析「1.15亿」「9945.84万」「-3094.94万」这类中文金额为元。"""
+    text = str(value).strip()
+    if text in ("", "--", "nan", "None"):
+        return None
+    mult = 1.0
+    if text.endswith("亿"):
+        mult, text = 1e8, text[:-1]
+    elif text.endswith("万"):
+        mult, text = 1e4, text[:-1]
+    try:
+        return float(text) * mult
+    except ValueError:
+        return None
+
+
+def fmt_amount(value, signed: bool = False) -> str:
+    if value is None:
+        return "--"
+    prefix = "-" if value < 0 else ("+" if signed and value > 0 else "")
+    amount = abs(value)
+    if amount >= 1e8:
+        body = f"{amount / 1e8:.2f}亿"
+    elif amount >= 1e4:
+        body = f"{amount / 1e4:.0f}万"
+    else:
+        body = f"{amount:.0f}"
+    return prefix + body
+
+
 def name_initials(name: str) -> str:
     py = "".join(lazy_pinyin(str(name), style=Style.FIRST_LETTER)).lower()
     return re.sub(r"[^a-z0-9]", "", py)
@@ -162,7 +192,7 @@ def get_index_spot() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_a_spot() -> pd.DataFrame:
     """沪深京 A 股实时快照（含名称、最新价、昨收、涨跌幅）。"""
     df = ak.stock_zh_a_spot().copy()
@@ -171,6 +201,20 @@ def get_a_spot() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_fund_flow() -> pd.DataFrame:
+    """同花顺个股资金流（即时）：换手率、流入/流出/净额，单位统一为元。"""
+    df = ak.stock_fund_flow_individual(symbol="即时").copy()
+    df = df.rename(columns={"股票代码": "代码"})
+    df["代码"] = df["代码"].astype(str).str.zfill(6).map(normalize_code)
+    df["换手率"] = pd.to_numeric(
+        df["换手率"].astype(str).str.rstrip("%"), errors="coerce"
+    )
+    for col in ("流入资金", "流出资金", "净额"):
+        df[col] = df[col].map(parse_cn_amount)
+    return df[["代码", "换手率", "流入资金", "流出资金", "净额"]]
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -447,8 +491,8 @@ def ma_legend_html(unit: str) -> str:
     return f"<div style='font-size:0.72rem;line-height:1.4;margin-left:2px'>{items}</div>"
 
 
-def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
-                      period_label: str, range_label: str) -> None:
+def render_watch_card(col, code: str, spot: pd.DataFrame, flow: pd.DataFrame,
+                      chart_type: str, period_label: str, range_label: str) -> None:
     row = spot[spot["代码"] == code] if not spot.empty else spot.iloc[0:0]
     name = str(row.iloc[0]["名称"]) if not row.empty else ""
     price = to_float(row.iloc[0].get("最新价")) if not row.empty else None
@@ -456,17 +500,33 @@ def render_watch_card(col, code: str, spot: pd.DataFrame, chart_type: str,
     pct = to_float(row.iloc[0].get("涨跌幅")) if not row.empty else None
     prev_close = to_float(row.iloc[0].get("昨收")) if not row.empty else None
 
+    flow_row = flow[flow["代码"] == code] if not flow.empty else flow.iloc[0:0]
+    turnover = to_float(flow_row.iloc[0].get("换手率")) if not flow_row.empty else None
+    inflow = to_float(flow_row.iloc[0].get("流入资金")) if not flow_row.empty else None
+    outflow = to_float(flow_row.iloc[0].get("流出资金")) if not flow_row.empty else None
+    net = to_float(flow_row.iloc[0].get("净额")) if not flow_row.empty else None
+
     with col:
         with st.container(border=True):
             color = color_of(chg)
             price_txt = f"{price:.2f}" if price is not None else "--"
             pct_txt = f"{pct:+.2f}%" if pct is not None else "--"
+            turnover_txt = f"{turnover:.2f}%" if turnover is not None else "--"
+            net_color = color_of(net)
             st.markdown(
                 f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
                 f"<span style='font-weight:600'>{name or '未知股票'}</span>"
                 f"<span style='color:#999;font-size:0.8rem'>{code}</span></div>"
                 f"<div style='color:{color};font-size:1.1rem;font-weight:600'>"
-                f"{price_txt}　{pct_txt}</div>",
+                f"{price_txt}　{pct_txt}</div>"
+                f"<div style='font-size:0.75rem;color:#666;margin-top:2px'>"
+                f"换手率 <span style='color:#333'>{turnover_txt}</span>"
+                f"<span style='margin:0 8px;color:#ddd'>|</span>"
+                f"净流入 <span style='color:{net_color};font-weight:600'>"
+                f"{fmt_amount(net, signed=True)}</span></div>"
+                f"<div style='font-size:0.72rem;color:#888;margin-top:1px'>"
+                f"流入 <span style='color:{UP_COLOR}'>{fmt_amount(inflow)}</span>"
+                f"　流出 <span style='color:{DOWN_COLOR}'>{fmt_amount(outflow)}</span></div>",
                 unsafe_allow_html=True,
             )
             try:
@@ -585,11 +645,18 @@ def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> 
             except Exception as exc:
                 spot = pd.DataFrame()
                 st.caption(f"个股快照获取失败：{exc}")
+            try:
+                flow = get_fund_flow()
+            except Exception as exc:
+                flow = pd.DataFrame(columns=["代码", "换手率", "流入资金", "流出资金", "净额"])
+                st.caption(f"资金流数据获取失败：{exc}")
             with st.spinner("加载自选图表…"):
                 for i in range(0, len(codes), 3):
                     cols = st.columns(3)
                     for col, code in zip(cols, codes[i:i + 3]):
-                        render_watch_card(col, code, spot, chart_type, period_label, range_label)
+                        render_watch_card(
+                            col, code, spot, flow, chart_type, period_label, range_label
+                        )
             st.caption(f"自选图表更新于 {dt.datetime.now():%H:%M:%S}")
 
     with log_col:
