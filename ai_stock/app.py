@@ -743,40 +743,39 @@ def main() -> None:
         stock_index = pd.DataFrame(columns=["代码", "名称", "首字母"])
         st.warning(f"股票列表获取失败，暂时只能按代码添加：{exc}")
 
-    st.subheader("自选看板")
+    with st.container(border=True, key="watch_controls"):
+        st.subheader("自选看板")
 
-    a1, a2, a3 = st.columns([2.4, 2.4, 1])
-    query = a1.text_input(
-        "添加自选", placeholder="输入代码或名称首字母，如 600519 / gzmt", key="add_query"
-    )
-    matches = resolve_stocks(query, stock_index)
-    labels = [f"{c}　{n}" if n else c for c, n in matches[:30]]
-    picked_idx = None
-    if labels:
-        picked = a2.selectbox("匹配结果", labels, key="add_pick")
-        picked_idx = labels.index(picked)
-    elif query.strip():
-        a2.caption("无匹配股票")
-    else:
-        a2.caption("输入后从匹配结果中选择")
-    if a3.button("添加", type="primary", width="stretch",
-                 disabled=picked_idx is None, key="add_btn"):
-        code = matches[picked_idx][0]
-        if code in st.session_state.watchlist:
-            st.toast("已在自选看板中")
-        else:
-            add_to_watchlist(code)
-            st.toast("已添加到自选看板")
+        a1, a2, a3 = st.columns([2.4, 2.4, 1], vertical_alignment="bottom")
+        query = a1.text_input(
+            "添加自选", placeholder="输入代码或名称首字母，如 600519 / gzmt", key="add_query"
+        )
+        matches = resolve_stocks(query, stock_index)
+        labels = [f"{c}　{n}" if n else c for c, n in matches[:30]]
+        picked_idx = None
+        if labels:
+            picked = a2.selectbox("匹配结果", labels, key="add_pick")
+            picked_idx = labels.index(picked)
+        if a3.button("添加", type="primary", width="stretch",
+                     disabled=picked_idx is None, key="add_btn"):
+            code = matches[picked_idx][0]
+            if code in st.session_state.watchlist:
+                st.toast("已在自选看板中")
+            else:
+                add_to_watchlist(code)
+                st.toast("已添加到自选看板")
+        if not labels:
+            st.caption("无匹配股票" if query.strip() else "输入代码或名称首字母，再从「匹配结果」中选择后点击添加")
 
-    c1, c2, c3 = st.columns([1.4, 1, 1])
-    chart_type = c1.radio("图表类型", ["K线", "分时"], horizontal=True)
-    is_kline = chart_type == "K线"
-    period_label = c2.selectbox("K线周期", list(PERIODS.keys()), disabled=not is_kline)
-    range_label = c3.selectbox("时间范围", list(RANGES.keys()), index=2, disabled=not is_kline)
+        c1, c2, c3 = st.columns([1.4, 1, 1])
+        chart_type = c1.radio("图表类型", ["K线", "分时"], horizontal=True)
+        is_kline = chart_type == "K线"
+        period_label = c2.selectbox("K线周期", list(PERIODS.keys()), disabled=not is_kline)
+        range_label = c3.selectbox("时间范围", list(RANGES.keys()), index=2, disabled=not is_kline)
 
-    if len(st.session_state.watchlist) >= 2:
-        st.caption("拖动下方标签可调整自选看板顺序")
-        apply_sort_order(stock_index)
+        if len(st.session_state.watchlist) >= 2:
+            st.caption("拖动下方标签可调整自选看板顺序")
+            apply_sort_order(stock_index)
 
     watch_panel(chart_type, period_label, range_label)
 
