@@ -36,6 +36,16 @@ INDEXES = [
     ("000688", "科创50"),
 ]
 
+# (接口类型, AKShare 代码, 显示代码, 显示名称)
+GLOBAL_INDEXES = [
+    ("us", ".DJI", "DJI", "道琼斯"),
+    ("us", ".IXIC", "IXIC", "纳斯达克"),
+    ("us", ".INX", "SPX", "标普500"),
+    ("sina", "日经225指数", "N225", "日经225"),
+    ("sina", "首尔综合指数", "KOSPI", "韩国综合"),
+    ("sina", "中国台湾加权指数", "TWII", "台湾加权"),
+]
+
 PERIODS = {"日K": "daily", "周K": "weekly", "月K": "monthly"}
 RANGES = {"3个月": 90, "6个月": 180, "1年": 365, "3年": 1095, "全部": None}
 REFRESH_OPTIONS = {"关闭": 0, "15秒": 15, "30秒": 30, "60秒": 60}
@@ -215,6 +225,31 @@ def get_fund_flow() -> pd.DataFrame:
     for col in ("流入资金", "流出资金", "净额"):
         df[col] = df[col].map(parse_cn_amount)
     return df[["代码", "换手率", "流入资金", "流出资金", "净额"]]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_global_index_spot() -> pd.DataFrame:
+    """美股/日韩台主要指数，按最新两根日线计算涨跌。"""
+    rows = []
+    for kind, symbol, code, label in GLOBAL_INDEXES:
+        try:
+            if kind == "us":
+                df = ak.index_us_stock_sina(symbol=symbol)
+            else:
+                df = ak.index_global_hist_sina(symbol=symbol)
+            if df is None or len(df) < 2:
+                continue
+            close = float(df["close"].iloc[-1])
+            prev_close = float(df["close"].iloc[-2])
+            change = close - prev_close
+            pct = change / prev_close * 100 if prev_close else float("nan")
+            rows.append({
+                "代码": code, "名称": label,
+                "最新价": close, "涨跌额": change, "涨跌幅": pct,
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -456,9 +491,9 @@ def show_enlarged(code: str, name: str, chart_type: str,
 
 # ---------------------------------------------------------------- 页面
 
-def render_index_cards(spot: pd.DataFrame) -> None:
-    cols = st.columns(len(INDEXES))
-    for col, (code, label) in zip(cols, INDEXES):
+def render_index_cards(spot: pd.DataFrame, indexes) -> None:
+    cols = st.columns(len(indexes))
+    for col, (code, label) in zip(cols, indexes):
         row = spot[spot["代码"] == code]
         with col:
             if row.empty:
@@ -602,10 +637,23 @@ def apply_sort_order(stock_index: pd.DataFrame) -> None:
 def render_index_panel() -> None:
     try:
         index_spot = get_index_spot()
-        render_index_cards(index_spot)
+        render_index_cards(index_spot, INDEXES)
         st.caption(f"大盘指数更新于 {dt.datetime.now():%H:%M:%S}　数据来源：AKShare")
     except Exception as exc:
         st.warning(f"大盘指数获取失败：{exc}")
+
+    try:
+        global_spot = get_global_index_spot()
+    except Exception as exc:
+        global_spot = pd.DataFrame()
+        st.warning(f"全球指数获取失败：{exc}")
+    if not global_spot.empty:
+        items = [(code, label) for _, _, code, label in GLOBAL_INDEXES]
+        render_index_cards(global_spot, items)
+        st.caption(
+            f"全球指数更新于 {dt.datetime.now():%H:%M:%S}　"
+            "美股为最近收盘/盘中最新价，数据来源：新浪财经"
+        )
 
 
 def render_system_log_panel() -> None:
