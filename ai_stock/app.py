@@ -36,6 +36,21 @@ INDEXES = [
     ("000688", "科创50"),
 ]
 
+QUANT_STRATEGIES = [
+    "双均线交叉",
+    "MACD 金叉死叉",
+    "RSI 超买超卖",
+    "布林带突破",
+    "动量轮动",
+    "均值回归",
+    "网格交易",
+    "海龟交易法则",
+    "量价背离",
+    "多因子选股",
+    "趋势跟踪",
+    "配对交易",
+]
+
 # (接口类型, AKShare 代码, 显示代码, 显示名称)
 GLOBAL_INDEXES = [
     ("us", ".DJI", "DJI", "道琼斯"),
@@ -527,7 +542,8 @@ def ma_legend_html(unit: str) -> str:
 
 
 def render_watch_card(col, code: str, spot: pd.DataFrame, flow: pd.DataFrame,
-                      chart_type: str, period_label: str, range_label: str) -> None:
+                      chart_df: pd.DataFrame, chart_type: str,
+                      period_label: str, range_label: str) -> None:
     row = spot[spot["代码"] == code] if not spot.empty else spot.iloc[0:0]
     name = str(row.iloc[0]["名称"]) if not row.empty else ""
     price = to_float(row.iloc[0].get("最新价")) if not row.empty else None
@@ -564,29 +580,30 @@ def render_watch_card(col, code: str, spot: pd.DataFrame, flow: pd.DataFrame,
                 f"　流出 <span style='color:{DOWN_COLOR}'>{fmt_amount(outflow)}</span></div>",
                 unsafe_allow_html=True,
             )
+            fig = None
             try:
-                if chart_type == "分时":
-                    df = get_intraday(code)
-                    fig = make_intraday_fig(df, prev_close, height=280, compact=True) if not df.empty else None
-                else:
-                    df = load_kline(code, period_label, range_label)
-                    fig = make_kline_fig(
-                        df, height=280, compact=True, unit=PERIOD_UNITS[period_label]
-                    ) if not df.empty else None
-                if fig is None:
-                    st.caption("暂无数据")
-                else:
-                    st.plotly_chart(
-                        fig, width="stretch", key=f"mini_{code}",
-                        config={"displayModeBar": False},
-                    )
-                    if chart_type == "K线":
-                        st.markdown(
-                            ma_legend_html(PERIOD_UNITS[period_label]),
-                            unsafe_allow_html=True,
+                if chart_df is not None and not chart_df.empty:
+                    if chart_type == "分时":
+                        fig = make_intraday_fig(chart_df, prev_close, height=280, compact=True)
+                    else:
+                        fig = make_kline_fig(
+                            chart_df, height=280, compact=True,
+                            unit=PERIOD_UNITS[period_label],
                         )
             except Exception as exc:
-                st.caption(f"数据获取失败：{exc}")
+                st.caption(f"图表绘制失败：{exc}")
+            if fig is None:
+                st.caption("暂无数据")
+            else:
+                st.plotly_chart(
+                    fig, width="stretch", key=f"mini_{code}",
+                    config={"displayModeBar": False},
+                )
+                if chart_type == "K线":
+                    st.markdown(
+                        ma_legend_html(PERIOD_UNITS[period_label]),
+                        unsafe_allow_html=True,
+                    )
 
             b1, b2 = st.columns(2)
             if b1.button("放大", key=f"zoom_{code}", width="stretch"):
@@ -634,26 +651,152 @@ def apply_sort_order(stock_index: pd.DataFrame) -> None:
         add_log("调整自选看板顺序", "info")
 
 
-def render_index_panel() -> None:
+def compute_market_breadth(spot: pd.DataFrame):
+    """统计 A 股上涨/下跌/平盘家数（剔除停牌，即成交量为 0 的股票）。"""
+    if spot is None or spot.empty or "涨跌幅" not in spot.columns:
+        return None
+    pct = pd.to_numeric(spot["涨跌幅"], errors="coerce")
+    mask = pct.notna()
+    if "成交量" in spot.columns:
+        mask &= pd.to_numeric(spot["成交量"], errors="coerce").fillna(0) > 0
+    pct = pct[mask]
+    if pct.empty:
+        return None
+    return {
+        "up": int((pct > 0).sum()),
+        "down": int((pct < 0).sum()),
+        "flat": int((pct == 0).sum()),
+        "total": int(pct.size),
+    }
+
+
+def collect_index_snapshot() -> dict:
+    errors = []
     try:
         index_spot = get_index_spot()
-        render_index_cards(index_spot, INDEXES)
-        st.caption(f"大盘指数更新于 {dt.datetime.now():%H:%M:%S}　数据来源：AKShare")
     except Exception as exc:
-        st.warning(f"大盘指数获取失败：{exc}")
-
+        index_spot = pd.DataFrame()
+        errors.append(f"大盘指数获取失败：{exc}")
     try:
         global_spot = get_global_index_spot()
     except Exception as exc:
         global_spot = pd.DataFrame()
-        st.warning(f"全球指数获取失败：{exc}")
+        errors.append(f"全球指数获取失败：{exc}")
+    breadth = None
+    try:
+        breadth = compute_market_breadth(get_a_spot())
+    except Exception as exc:
+        errors.append(f"A股涨跌家数获取失败：{exc}")
+    return {
+        "index_spot": index_spot,
+        "global_spot": global_spot,
+        "breadth": breadth,
+        "updated": dt.datetime.now(),
+        "errors": errors,
+    }
+
+
+def collect_watch_snapshot(chart_type: str, period_label: str, range_label: str) -> dict:
+    codes = tuple(st.session_state.get("watchlist", []))
+    errors = []
+    spot = pd.DataFrame()
+    flow = pd.DataFrame()
+    charts: dict[str, pd.DataFrame] = {}
+    if codes:
+        try:
+            spot = get_a_spot()
+        except Exception as exc:
+            errors.append(f"个股快照获取失败：{exc}")
+        try:
+            flow = get_fund_flow()
+        except Exception as exc:
+            errors.append(f"资金流数据获取失败：{exc}")
+        for code in codes:
+            try:
+                if chart_type == "分时":
+                    charts[code] = get_intraday(code)
+                else:
+                    charts[code] = load_kline(code, period_label, range_label)
+            except Exception as exc:
+                charts[code] = pd.DataFrame()
+                errors.append(f"{code} 图表获取失败：{exc}")
+    return {
+        "key": (codes, chart_type, period_label, range_label),
+        "spot": spot,
+        "flow": flow,
+        "charts": charts,
+        "updated": dt.datetime.now(),
+        "errors": errors,
+    }
+
+
+def ensure_watch_snapshot(chart_type: str, period_label: str, range_label: str) -> None:
+    key = (
+        tuple(st.session_state.get("watchlist", [])),
+        chart_type, period_label, range_label,
+    )
+    snapshot = st.session_state.get("watch_snapshot")
+    if snapshot is None or snapshot.get("key") != key:
+        st.session_state["watch_snapshot"] = collect_watch_snapshot(
+            chart_type, period_label, range_label
+        )
+
+
+def refresh_snapshots() -> None:
+    """不可见的定时刷新：耗时请求与可见渲染分离，避免刷新时整块区域发白卡顿。"""
+    st.session_state["index_snapshot"] = collect_index_snapshot()
+    params = st.session_state.get("panel_params")
+    if params:
+        st.session_state["watch_snapshot"] = collect_watch_snapshot(*params)
+
+
+def render_market_breadth(breadth: dict) -> None:
+    up, down, flat = breadth["up"], breadth["down"], breadth["flat"]
+    total = breadth["total"] or 1
+    up_w = up / total * 100
+    down_w = down / total * 100
+    st.markdown(
+        f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:10px 14px;background:#fff;display:flex;align-items:center;gap:18px;margin-top:6px">
+<span style="color:#555;font-size:0.92rem;white-space:nowrap">A股涨跌家数</span>
+<span style="color:{UP_COLOR};font-weight:600;white-space:nowrap">上涨 {up:,} 家</span>
+<span style="color:{FLAT_COLOR};white-space:nowrap">平盘 {flat:,} 家</span>
+<span style="color:{DOWN_COLOR};font-weight:600;white-space:nowrap">下跌 {down:,} 家</span>
+<div style="flex:1;min-width:120px;height:8px;border-radius:999px;overflow:hidden;background:#eee;display:flex">
+<div style="width:{up_w:.1f}%;background:{UP_COLOR}"></div>
+<div style="width:{down_w:.1f}%;background:{DOWN_COLOR}"></div>
+</div>
+<span style="color:#999;font-size:0.78rem;white-space:nowrap">共 {total:,} 只</span>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_index_panel() -> None:
+    snapshot = st.session_state.get("index_snapshot", {})
+    updated = snapshot.get("updated")
+    stamp = f"{updated:%H:%M:%S}" if updated else "--"
+
+    index_spot = snapshot.get("index_spot", pd.DataFrame())
+    if not index_spot.empty:
+        render_index_cards(index_spot, INDEXES)
+        st.caption(f"大盘指数更新于 {stamp}　数据来源：AKShare")
+
+    global_spot = snapshot.get("global_spot", pd.DataFrame())
     if not global_spot.empty:
         items = [(code, label) for _, _, code, label in GLOBAL_INDEXES]
         render_index_cards(global_spot, items)
         st.caption(
-            f"全球指数更新于 {dt.datetime.now():%H:%M:%S}　"
+            f"全球指数更新于 {stamp}　"
             "美股为最近收盘/盘中最新价，数据来源：新浪财经"
         )
+
+    breadth = snapshot.get("breadth")
+    if breadth:
+        render_market_breadth(breadth)
+
+    errors = snapshot.get("errors") or []
+    if errors:
+        st.warning("；".join(errors))
 
 
 def render_system_log_panel() -> None:
@@ -682,30 +825,31 @@ def render_system_log_panel() -> None:
 
 def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> None:
     codes = st.session_state.get("watchlist", [])
+    snapshot = st.session_state.get("watch_snapshot", {})
+    spot = snapshot.get("spot", pd.DataFrame())
+    flow = snapshot.get("flow", pd.DataFrame())
+    charts = snapshot.get("charts", {})
+    updated = snapshot.get("updated")
+    stamp = f"{updated:%H:%M:%S}" if updated else "--"
+
     main_col, log_col = st.columns([3.3, 1], gap="medium")
 
     with main_col:
         if not codes:
             st.info("自选看板为空：在上方输入代码或名称首字母，选择匹配结果后点击「添加」。")
         else:
-            try:
-                spot = get_a_spot()
-            except Exception as exc:
-                spot = pd.DataFrame()
-                st.caption(f"个股快照获取失败：{exc}")
-            try:
-                flow = get_fund_flow()
-            except Exception as exc:
-                flow = pd.DataFrame(columns=["代码", "换手率", "流入资金", "流出资金", "净额"])
-                st.caption(f"资金流数据获取失败：{exc}")
-            with st.spinner("加载自选图表…"):
-                for i in range(0, len(codes), 3):
-                    cols = st.columns(3)
-                    for col, code in zip(cols, codes[i:i + 3]):
-                        render_watch_card(
-                            col, code, spot, flow, chart_type, period_label, range_label
-                        )
-            st.caption(f"自选图表更新于 {dt.datetime.now():%H:%M:%S}")
+            errors = snapshot.get("errors") or []
+            if errors:
+                st.caption("；".join(errors))
+            for i in range(0, len(codes), 3):
+                cols = st.columns(3)
+                for col, code in zip(cols, codes[i:i + 3]):
+                    render_watch_card(
+                        col, code, spot, flow,
+                        charts.get(code, pd.DataFrame()),
+                        chart_type, period_label, range_label,
+                    )
+            st.caption(f"自选图表更新于 {stamp}")
 
     with log_col:
         render_system_log_panel()
@@ -719,15 +863,6 @@ def main() -> None:
         refresh_label = st.selectbox("自动刷新", list(REFRESH_OPTIONS.keys()), index=2)
 
     refresh = REFRESH_OPTIONS[refresh_label]
-    if refresh:
-        index_panel = st.fragment(render_index_panel, run_every=refresh)
-        watch_panel = st.fragment(render_watch_panel, run_every=refresh)
-    else:
-        index_panel = render_index_panel
-        watch_panel = render_watch_panel
-
-    index_panel()
-    st.divider()
 
     if "watchlist" not in st.session_state:
         st.session_state.watchlist = load_watchlist()
@@ -736,6 +871,22 @@ def main() -> None:
         st.session_state.system_logs = []
         add_log("行情服务已连接，自选看板就绪", "success")
         add_log("量化信号模块待接入，交易提示将显示在此", "info")
+
+    if "index_snapshot" not in st.session_state:
+        st.session_state["index_snapshot"] = collect_index_snapshot()
+
+    if refresh:
+        refresh_frag = st.fragment(refresh_snapshots, run_every=refresh)
+        index_panel = st.fragment(render_index_panel, run_every=refresh)
+        watch_panel = st.fragment(render_watch_panel, run_every=refresh)
+        refresh_frag()
+    else:
+        refresh_snapshots()
+        index_panel = render_index_panel
+        watch_panel = render_watch_panel
+
+    index_panel()
+    st.divider()
 
     try:
         stock_index = get_stock_index()
@@ -777,6 +928,22 @@ def main() -> None:
             st.caption("拖动下方标签可调整自选看板顺序")
             apply_sort_order(stock_index)
 
+    with st.container(border=True, key="quant_strategies"):
+        st.subheader("量化策略")
+        st.caption("勾选需要关注的策略（当前仅界面展示，算法待接入）")
+        for start in range(0, len(QUANT_STRATEGIES), 4):
+            cols = st.columns(4)
+            for col, idx in zip(cols, range(start, min(start + 4, len(QUANT_STRATEGIES)))):
+                col.checkbox(QUANT_STRATEGIES[idx], key=f"strategy_{idx}")
+        selected = [
+            QUANT_STRATEGIES[i] for i in range(len(QUANT_STRATEGIES))
+            if st.session_state.get(f"strategy_{i}")
+        ]
+        if selected:
+            st.caption(f"已选择 {len(selected)} 个：{'、'.join(selected)}")
+
+    st.session_state["panel_params"] = (chart_type, period_label, range_label)
+    ensure_watch_snapshot(chart_type, period_label, range_label)
     watch_panel(chart_type, period_label, range_label)
 
 
