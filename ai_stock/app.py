@@ -730,16 +730,23 @@ def collect_index_snapshot() -> dict:
 
     breadth = None
     market_amount = None
+    market_amount_sh = None
+    market_amount_sz = None
     flow_agg = None
     breadth_source = "同花顺"
     try:
         fund_flow = get_fund_flow()
         if not fund_flow.empty:
             breadth = compute_breadth_from_flow(fund_flow)
-            amount_sum = float(
-                pd.to_numeric(fund_flow["成交额"], errors="coerce").fillna(0).sum()
-            )
+            amounts = pd.to_numeric(fund_flow["成交额"], errors="coerce").fillna(0)
+            amount_sum = float(amounts.sum())
             market_amount = amount_sum if amount_sum > 0 else None
+            flow_codes = fund_flow["代码"].astype(str)
+            sh_amount = float(amounts[flow_codes.str.startswith("6")].sum())
+            if sh_amount > 0:
+                market_amount_sh = sh_amount
+                sz_amount = amount_sum - sh_amount
+                market_amount_sz = sz_amount if sz_amount > 0 else None
             flow_agg = {
                 "inflow": float(pd.to_numeric(fund_flow["流入资金"], errors="coerce").fillna(0).sum()),
                 "outflow": float(pd.to_numeric(fund_flow["流出资金"], errors="coerce").fillna(0).sum()),
@@ -788,6 +795,8 @@ def collect_index_snapshot() -> dict:
         "breadth": breadth,
         "breadth_source": breadth_source,
         "market_amount": market_amount,
+        "market_amount_sh": market_amount_sh,
+        "market_amount_sz": market_amount_sz,
         "flow_agg": flow_agg,
         "hsgt": hsgt,
         "main_flow": main_flow,
@@ -890,8 +899,9 @@ def refresh_snapshots() -> None:
         run_enabled_strategies(snapshot)
 
 
-def render_market_breadth(breadth: dict, market_amount, flow_agg,
-                          breadth_source: str, hsgt, main_flow) -> None:
+def render_market_breadth(breadth: dict, market_amount, market_amount_sh,
+                          market_amount_sz, flow_agg, breadth_source: str,
+                          hsgt, main_flow) -> None:
     up, down, flat = breadth["up"], breadth["down"], breadth["flat"]
     total = breadth["total"] or 1
     up_w = up / total * 100
@@ -953,6 +963,27 @@ def render_market_breadth(breadth: dict, market_amount, flow_agg,
         + "".join(parts) + "</div>"
     )
 
+    amount_parts = []
+    if market_amount_sh:
+        amount_parts.append(
+            "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>沪市 "
+            f"<span style='color:#333;font-weight:600'>{fmt_amount(market_amount_sh)}</span></span>"
+        )
+    if market_amount_sz:
+        amount_parts.append(
+            "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>深市 "
+            f"<span style='color:#333;font-weight:600'>{fmt_amount(market_amount_sz)}</span></span>"
+        )
+    amount_parts.append(
+        "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>合计 "
+        f"<span style='color:#333;font-weight:600'>{amount_txt}</span></span>"
+    )
+    amount_html = (
+        "<div style='display:flex;align-items:center;gap:18px;flex-wrap:wrap'>"
+        "<span style='color:#555;font-size:0.92rem;white-space:nowrap'>市场成交额</span>"
+        + "".join(amount_parts) + "</div>"
+    )
+
     st.markdown(
         f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:10px 14px;background:#fff;display:flex;flex-direction:column;gap:6px;margin-top:6px">
 <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
@@ -965,12 +996,11 @@ def render_market_breadth(breadth: dict, market_amount, flow_agg,
 <div style="width:{up_w:.1f}%;background:{UP_COLOR}"></div>
 <div style="width:{down_w:.1f}%;background:{DOWN_COLOR}"></div>
 </div>
-<span style="color:#888;font-size:0.88rem;white-space:nowrap">两市成交额
-<span style="color:#333;font-weight:600">{amount_txt}</span></span>
 <span style="color:#999;font-size:0.78rem;white-space:nowrap">共 {total:,} 只</span>
 </div>
 {flow_html}
 {money_html}
+{amount_html}
 </div>""",
         unsafe_allow_html=True,
     )
@@ -1000,6 +1030,8 @@ def render_index_panel() -> None:
         render_market_breadth(
             breadth,
             snapshot.get("market_amount"),
+            snapshot.get("market_amount_sh"),
+            snapshot.get("market_amount_sz"),
             snapshot.get("flow_agg"),
             snapshot.get("breadth_source", "同花顺"),
             snapshot.get("hsgt"),
@@ -1041,10 +1073,21 @@ def render_quant_strategy_box() -> None:
     with st.container(border=True, key="quant_strategies"):
         st.subheader("量化策略")
         st.caption("勾选需要关注的策略（双均线交叉已接入，其余算法待实现）")
-        for start in range(0, len(QUANT_STRATEGIES), 4):
-            cols = st.columns(4)
-            for col, idx in zip(cols, range(start, min(start + 4, len(QUANT_STRATEGIES)))):
-                col.checkbox(QUANT_STRATEGIES[idx], key=f"strategy_{idx}")
+        per_row = 4
+        for start in range(0, len(QUANT_STRATEGIES), per_row):
+            names = QUANT_STRATEGIES[start:start + per_row]
+            widths = []
+            for _ in names:
+                widths += [2.2, 0.55]
+            cols = st.columns(widths, vertical_alignment="center")
+            for j, name in enumerate(names):
+                idx = start + j
+                cols[j * 2].checkbox(name, key=f"strategy_{idx}")
+                color = strategies.STRATEGY_COLORS[name]
+                cols[j * 2 + 1].markdown(
+                    f"<span style='color:{color};font-size:1rem'>●</span>",
+                    unsafe_allow_html=True,
+                )
         selected = [
             QUANT_STRATEGIES[i] for i in range(len(QUANT_STRATEGIES))
             if st.session_state.get(f"strategy_{i}")
