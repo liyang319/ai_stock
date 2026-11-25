@@ -7,6 +7,7 @@
 """
 
 import datetime as dt
+import html
 import json
 import os
 import re
@@ -43,6 +44,9 @@ MA_PERIODS = (5, 10, 20, 30)
 # 通达信/同花顺习惯：5日白、10日黄、20日紫、30日绿（白底上 5日 用灰色替代）
 MA_COLORS = {5: "#9e9e9e", 10: "#e6a700", 20: "#d000d0", 30: "#00a651"}
 PERIOD_UNITS = {"日K": "日", "周K": "周", "月K": "月"}
+
+LOG_COLORS = {"info": "#3b82f6", "success": "#1aa260", "warning": "#f59e0b", "error": "#e5333c"}
+LOG_MAX_ENTRIES = 100
 
 WATCHLIST_FILE = Path(
     os.environ.get("WATCHLIST_FILE", Path(__file__).with_name("watchlist.json"))
@@ -106,10 +110,22 @@ def save_watchlist(codes: list[str]) -> None:
         st.warning(f"自选列表保存失败：{exc}")
 
 
+def add_log(message: str, level: str = "info") -> None:
+    """记录系统日志。量化算法产生信号后可直接调用此函数写入提示。"""
+    logs = st.session_state.setdefault("system_logs", [])
+    logs.append({
+        "time": dt.datetime.now().strftime("%H:%M:%S"),
+        "level": level,
+        "message": message,
+    })
+    del logs[:-LOG_MAX_ENTRIES]
+
+
 def add_to_watchlist(code: str) -> None:
     if code not in st.session_state.watchlist:
         st.session_state.watchlist.append(code)
         save_watchlist(st.session_state.watchlist)
+        add_log(f"添加自选 {code}", "success")
 
 
 def remove_from_watchlist(code: str) -> None:
@@ -117,6 +133,7 @@ def remove_from_watchlist(code: str) -> None:
         c for c in st.session_state.watchlist if c != code
     ]
     save_watchlist(st.session_state.watchlist)
+    add_log(f"移除自选 {code}", "warning")
 
 
 # ---------------------------------------------------------------- 数据接口
@@ -519,6 +536,7 @@ def apply_sort_order(stock_index: pd.DataFrame) -> None:
     if new_codes != codes:
         st.session_state.watchlist = new_codes
         save_watchlist(new_codes)
+        add_log("调整自选看板顺序", "info")
 
 
 def render_index_panel() -> None:
@@ -530,22 +548,52 @@ def render_index_panel() -> None:
         st.warning(f"大盘指数获取失败：{exc}")
 
 
+def render_system_log_panel() -> None:
+    logs = st.session_state.get("system_logs", [])
+    with st.container(border=True, key="system_log_panel"):
+        st.markdown("#### :material/terminal: 系统日志")
+        st.caption("量化信号与系统事件")
+        with st.container(height=520, border=False):
+            if not logs:
+                st.caption("暂无日志")
+                return
+            rows = []
+            for entry in reversed(logs[-60:]):
+                color = LOG_COLORS.get(entry["level"], "#9aa0a6")
+                rows.append(
+                    "<div style='display:flex;gap:8px;align-items:flex-start;"
+                    "padding:6px 4px;border-bottom:1px dashed #ececec'>"
+                    f"<span style='color:#9aa0a6;font-size:0.72rem;"
+                    f"font-family:ui-monospace,monospace;padding-top:2px'>{entry['time']}</span>"
+                    f"<span style='color:{color};font-size:0.72rem;line-height:1.5'>●</span>"
+                    f"<span style='color:#333;font-size:0.8rem;line-height:1.5;"
+                    f"word-break:break-all'>{html.escape(entry['message'])}</span></div>"
+                )
+            st.markdown("".join(rows), unsafe_allow_html=True)
+
+
 def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> None:
     codes = st.session_state.get("watchlist", [])
-    if not codes:
-        st.info("自选看板为空：在上方输入代码或名称首字母，选择匹配结果后点击「添加」。")
-        return
-    try:
-        spot = get_a_spot()
-    except Exception as exc:
-        spot = pd.DataFrame()
-        st.caption(f"个股快照获取失败：{exc}")
-    with st.spinner("加载自选图表…"):
-        for i in range(0, len(codes), 4):
-            cols = st.columns(4)
-            for col, code in zip(cols, codes[i:i + 4]):
-                render_watch_card(col, code, spot, chart_type, period_label, range_label)
-    st.caption(f"自选图表更新于 {dt.datetime.now():%H:%M:%S}")
+    main_col, log_col = st.columns([3.3, 1], gap="medium")
+
+    with main_col:
+        if not codes:
+            st.info("自选看板为空：在上方输入代码或名称首字母，选择匹配结果后点击「添加」。")
+        else:
+            try:
+                spot = get_a_spot()
+            except Exception as exc:
+                spot = pd.DataFrame()
+                st.caption(f"个股快照获取失败：{exc}")
+            with st.spinner("加载自选图表…"):
+                for i in range(0, len(codes), 3):
+                    cols = st.columns(3)
+                    for col, code in zip(cols, codes[i:i + 3]):
+                        render_watch_card(col, code, spot, chart_type, period_label, range_label)
+            st.caption(f"自选图表更新于 {dt.datetime.now():%H:%M:%S}")
+
+    with log_col:
+        render_system_log_panel()
 
 
 def main() -> None:
@@ -568,6 +616,11 @@ def main() -> None:
 
     if "watchlist" not in st.session_state:
         st.session_state.watchlist = load_watchlist()
+
+    if "system_logs" not in st.session_state:
+        st.session_state.system_logs = []
+        add_log("行情服务已连接，自选看板就绪", "success")
+        add_log("量化信号模块待接入，交易提示将显示在此", "info")
 
     try:
         stock_index = get_stock_index()
