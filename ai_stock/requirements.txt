@@ -4,4 +4,5 @@ plotly>=5.24
 pandas>=2.0
 pypinyin>=0.50
 streamlit-sortables>=0.3
+openpyxl>=3.1
 

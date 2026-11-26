@@ -23,6 +23,7 @@ from plotly.subplots import make_subplots
 from pypinyin import Style, lazy_pinyin
 from streamlit_sortables import sort_items
 
+import excel_log
 import strategies
 import strategy_bollinger
 import strategy_dual_ma
@@ -42,6 +43,7 @@ st.set_page_config(page_title="股票行情助手", page_icon="📈", layout="wi
 UP_COLOR = "#e5333c"      # 中国习惯：红涨
 DOWN_COLOR = "#1aa260"    # 绿跌
 FLAT_COLOR = "#666666"
+FLAT_BAR_COLOR = "#9e9e9e"   # 涨跌条中的平盘段，加深的灰色
 
 INDEXES = [
     ("000001", "上证指数"),
@@ -898,6 +900,7 @@ def run_enabled_strategies(snapshot: dict) -> None:
     if not spot.empty:
         names = dict(zip(spot["代码"].astype(str), spot["名称"].astype(str)))
     seen = st.session_state.setdefault("strategy_signal_keys", set())
+    trade_entries = []
 
     for strategy, signal_fn in STRATEGY_RUNNERS.items():
         try:
@@ -922,14 +925,34 @@ def run_enabled_strategies(snapshot: dict) -> None:
             seen.add(signal_key)
             price = to_float(daily["收盘"].iloc[-1])
             price_txt = f"{price:.2f}" if price is not None else "--"
+            now_dt = dt.datetime.now()
+            now = now_dt.strftime("%H:%M:%S")
+            trade_date = now_dt.strftime("%Y-%m-%d")
+            stock_name = names.get(code, code)
             add_log(
                 strategies.format_signal_log(
-                    strategy, names.get(code, code), action, price_txt,
-                    SIGNAL_QUANTITY, dt.datetime.now().strftime("%H:%M:%S"),
+                    strategy, stock_name, action, price_txt,
+                    SIGNAL_QUANTITY, now, trade_date,
                 ),
                 level="trade",
                 color=color,
             )
+            if price is not None:
+                trade_entries.append({
+                    "strategy": strategy,
+                    "stock": stock_name,
+                    "action": action,
+                    "price": price,
+                    "quantity": SIGNAL_QUANTITY,
+                    "time": now,
+                    "date": trade_date,
+                })
+
+    if trade_entries:
+        try:
+            excel_log.append_trade_logs(trade_entries)
+        except Exception as exc:
+            add_log(f"Excel 交易日志写入失败：{exc}", "debug")
 
 
 def refresh_snapshots() -> None:
@@ -948,6 +971,7 @@ def render_market_breadth(breadth: dict, market_amount, market_amount_sh,
     up, down, flat = breadth["up"], breadth["down"], breadth["flat"]
     total = breadth["total"] or 1
     up_w = up / total * 100
+    flat_w = flat / total * 100
     down_w = down / total * 100
     amount_txt = fmt_amount(market_amount) if market_amount else "--"
     scope = "同花顺口径·沪深A股" if breadth_source == "同花顺" else "新浪口径"
@@ -1037,6 +1061,7 @@ def render_market_breadth(breadth: dict, market_amount, market_amount_sh,
 <span style="color:{DOWN_COLOR};font-weight:600;white-space:nowrap">下跌 {down:,} 家</span>
 <div style="flex:1;min-width:120px;height:8px;border-radius:999px;overflow:hidden;background:#eee;display:flex">
 <div style="width:{up_w:.1f}%;background:{UP_COLOR}"></div>
+<div style="width:{flat_w:.1f}%;background:{FLAT_BAR_COLOR}"></div>
 <div style="width:{down_w:.1f}%;background:{DOWN_COLOR}"></div>
 </div>
 <span style="color:#999;font-size:0.78rem;white-space:nowrap">共 {total:,} 只</span>
@@ -1231,6 +1256,13 @@ def main() -> None:
             f"策略引擎初始化完成，已注册 {len(STRATEGY_RUNNERS)} 个量化策略",
             "debug",
         )
+
+    if not st.session_state.get("excel_ready"):
+        try:
+            excel_log.ensure_workbook()
+            st.session_state["excel_ready"] = True
+        except Exception as exc:
+            add_log(f"Excel 交易日志创建失败：{exc}", "debug")
 
     if "index_snapshot" not in st.session_state:
         st.session_state["index_snapshot"] = collect_index_snapshot()
