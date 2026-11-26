@@ -46,10 +46,14 @@ def ensure_database() -> None:
         conn.commit()
 
 
-def append_trade_logs(entries: list[dict]) -> None:
-    """批量写入交易日志（与 Excel all_deal 相同的字段）。"""
+def append_trade_logs(entries: list[dict], dedupe: bool = False) -> int:
+    """批量写入交易日志（与 Excel all_deal 相同的字段）。
+
+    dedupe=True 时按「策略+股票+买卖+交易日期」跳过已存在记录。
+    返回实际写入的条数。
+    """
     if not entries:
-        return
+        return 0
     rows = [
         (
             entry["strategy"], entry["stock"], entry["action"],
@@ -59,10 +63,28 @@ def append_trade_logs(entries: list[dict]) -> None:
         for entry in entries
     ]
     with _LOCK, closing(_open()) as conn:
-        conn.executemany(
-            "INSERT INTO trades "
-            "(strategy, stock, action, price, quantity, trade_time, trade_date) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
+        if dedupe:
+            dates = sorted({row[6] for row in rows})
+            placeholders = ",".join("?" for _ in dates)
+            existing = set(conn.execute(
+                "SELECT strategy, stock, action, trade_date FROM trades "
+                f"WHERE trade_date IN ({placeholders})",
+                dates,
+            ).fetchall())
+            rows = [r for r in rows if (r[0], r[1], r[2], r[6]) not in existing]
+        if rows:
+            conn.executemany(
+                "INSERT INTO trades "
+                "(strategy, stock, action, price, quantity, trade_time, trade_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        return len(rows)
+
+
+def clear_data() -> None:
+    """清空 trades 表（保留表结构）。"""
+    with _LOCK, closing(_open()) as conn:
+        conn.execute("DELETE FROM trades")
         conn.commit()

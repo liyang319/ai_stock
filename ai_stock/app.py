@@ -951,13 +951,91 @@ def run_enabled_strategies(snapshot: dict) -> None:
 
     if trade_entries:
         try:
-            excel_log.append_trade_logs(trade_entries)
+            excel_log.append_trade_logs(trade_entries, dedupe=True)
         except Exception as exc:
             add_log(f"Excel 交易日志写入失败：{exc}", "debug")
         try:
-            db_log.append_trade_logs(trade_entries)
+            db_log.append_trade_logs(trade_entries, dedupe=True)
         except Exception as exc:
             add_log(f"SQLite 交易日志写入失败：{exc}", "debug")
+
+
+def load_kline_until(code: str, end_date: dt.date) -> pd.DataFrame:
+    """取截至指定日期的日 K（前复权，约 9 个月窗口供长周期策略使用）。"""
+    start = (end_date - dt.timedelta(days=270)).strftime("%Y%m%d")
+    end = end_date.strftime("%Y%m%d")
+    return get_kline(code, "daily", start, end)
+
+
+def run_replay(target_date: dt.date) -> dict:
+    """按所选日期，用已勾选策略盘点自选股信号，并写入日志/Excel/数据库（去重）。"""
+    result = {"computed": 0, "excel": 0, "db": 0, "last_bar": None}
+    codes = list(st.session_state.get("watchlist", []))
+    if not codes:
+        return result
+    snapshot = st.session_state.get("watch_snapshot", {})
+    spot = snapshot.get("spot", pd.DataFrame())
+    names = (
+        dict(zip(spot["代码"].astype(str), spot["名称"].astype(str)))
+        if not spot.empty else {}
+    )
+    logged = st.session_state.setdefault("replay_logged_keys", set())
+    entries = []
+
+    for strategy, signal_fn in STRATEGY_RUNNERS.items():
+        idx = QUANT_STRATEGIES.index(strategy)
+        if not st.session_state.get(f"strategy_{idx}"):
+            continue
+        color = strategies.STRATEGY_COLORS[strategy]
+        for code in codes:
+            try:
+                daily = load_kline_until(code, target_date)
+                action = signal_fn(daily)
+            except Exception:
+                continue
+            if action is None or daily.empty:
+                continue
+            price = to_float(daily["收盘"].iloc[-1])
+            if price is None:
+                continue
+            bar_date = pd.to_datetime(daily["日期"].iloc[-1]).strftime("%Y-%m-%d")
+            result["last_bar"] = (
+                bar_date if result["last_bar"] is None
+                else max(result["last_bar"], bar_date)
+            )
+            stock_name = names.get(code, code)
+            log_key = f"{strategy}-{code}-{action}-{bar_date}"
+            if log_key not in logged:
+                logged.add(log_key)
+                add_log(
+                    strategies.format_signal_log(
+                        strategy, stock_name, action, f"{price:.2f}",
+                        SIGNAL_QUANTITY, "15:00:00", bar_date,
+                    ),
+                    level="trade",
+                    color=color,
+                )
+            entries.append({
+                "strategy": strategy,
+                "stock": stock_name,
+                "action": action,
+                "price": price,
+                "quantity": SIGNAL_QUANTITY,
+                "time": "15:00:00",
+                "date": bar_date,
+            })
+
+    result["computed"] = len(entries)
+    if entries:
+        try:
+            result["excel"] = excel_log.append_trade_logs(entries, dedupe=True)
+        except Exception as exc:
+            add_log(f"Excel 盘点写入失败：{exc}", "debug")
+        try:
+            result["db"] = db_log.append_trade_logs(entries, dedupe=True)
+        except Exception as exc:
+            add_log(f"SQLite 盘点写入失败：{exc}", "debug")
+    return result
 
 
 def refresh_snapshots() -> None:
@@ -1208,6 +1286,51 @@ def render_quant_strategy_box() -> None:
                 f"已选择 {len(selected)} 个：{chips}</div>",
                 unsafe_allow_html=True,
             )
+
+        st.divider()
+        btn_col, date_col = st.columns([1, 1.5], vertical_alignment="bottom")
+        with date_col:
+            replay_date = st.date_input(
+                "盘点日期",
+                value=dt.date.today(),
+                max_value=dt.date.today(),
+                key="replay_date",
+            )
+        with btn_col:
+            replay_clicked = st.button(
+                "盘点数据", key="replay_btn", type="primary", width="stretch"
+            )
+        if replay_clicked:
+            if not st.session_state.get("watchlist"):
+                st.info("自选看板为空，无法盘点。")
+            elif not selected:
+                st.info("请先勾选至少一个量化策略。")
+            else:
+                with st.spinner("盘点中…"):
+                    stats = run_replay(replay_date)
+                if stats["computed"] == 0:
+                    st.info(f"盘点完成：{replay_date} 没有产生交易信号。")
+                else:
+                    note = ""
+                    if (stats["last_bar"]
+                            and stats["last_bar"] != replay_date.strftime("%Y-%m-%d")):
+                        note = f"（所选日期非交易日，按最近交易日 {stats['last_bar']} 计算）"
+                    st.success(
+                        f"盘点完成：生成 {stats['computed']} 条信号，"
+                        f"新增入库 Excel {stats['excel']} 条 / 数据库 {stats['db']} 条{note}"
+                    )
+        if st.button("清除数据", key="clear_btn"):
+            try:
+                excel_log.clear_data()
+                db_log.clear_data()
+                st.session_state.pop("replay_logged_keys", None)
+                st.success("已清空 Excel 与数据库中的全部交易数据")
+            except Exception as exc:
+                st.error(f"清除失败：{exc}")
+        st.caption(
+            "盘点按所选交易日收盘数据计算，提示时间记为 15:00:00；"
+            "清除数据会删除 Excel 与数据库中的全部交易记录。"
+        )
 
 
 def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> None:

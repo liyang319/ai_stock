@@ -99,16 +99,51 @@ def _append_row(ws, entry: dict) -> None:
     ws.cell(row=row, column=5).number_format = '0"股"'
 
 
-def append_trade_logs(entries: list[dict]) -> None:
-    """追加交易日志：写入各自策略表，并按时间顺序汇总到 all_deal。"""
+def _existing_keys(wb) -> set:
+    keys = set()
+    for name in SEQUENCE:
+        ws = wb[name]
+        for row in range(2, ws.max_row + 1):
+            keys.add((
+                ws.cell(row, 1).value, ws.cell(row, 2).value,
+                ws.cell(row, 3).value, ws.cell(row, 7).value,
+            ))
+    return keys
+
+
+def append_trade_logs(entries: list[dict], dedupe: bool = False) -> int:
+    """追加交易日志：写入各自策略表，并按时间顺序汇总到 all_deal。
+
+    dedupe=True 时按「策略+股票+买卖+交易日期」跳过已存在记录。
+    返回实际写入的条数。
+    """
     if not entries:
-        return
+        return 0
     ordered = sorted(entries, key=lambda e: (e.get("date", ""), e["time"]))
     with _LOCK:
         wb = _load_or_new()
         _prepare_workbook(wb)
+        if dedupe:
+            existing = _existing_keys(wb)
+            ordered = [
+                e for e in ordered
+                if (e["strategy"], e["stock"], e["action"], e["date"]) not in existing
+            ]
         for entry in ordered:
             if entry["strategy"] in wb.sheetnames:
                 _append_row(wb[entry["strategy"]], entry)
             _append_row(wb[ALL_SHEET], entry)
+        wb.save(EXCEL_FILE)
+        return len(ordered)
+
+
+def clear_data() -> None:
+    """清空所有 sheet 的数据行，保留表头与工作表结构。"""
+    with _LOCK:
+        wb = _load_or_new()
+        _prepare_workbook(wb)
+        for name in SEQUENCE:
+            ws = wb[name]
+            if ws.max_row > 1:
+                ws.delete_rows(2, ws.max_row - 1)
         wb.save(EXCEL_FILE)
