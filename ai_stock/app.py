@@ -960,16 +960,24 @@ def run_enabled_strategies(snapshot: dict) -> None:
             add_log(f"SQLite 交易日志写入失败：{exc}", "debug")
 
 
-def load_kline_until(code: str, end_date: dt.date) -> pd.DataFrame:
-    """取截至指定日期的日 K（前复权，约 9 个月窗口供长周期策略使用）。"""
-    start = (end_date - dt.timedelta(days=270)).strftime("%Y%m%d")
-    end = end_date.strftime("%Y%m%d")
+def load_kline_before(code: str, trade_day: dt.date) -> pd.DataFrame:
+    """取所选日期之前（不含当日）的日 K，模拟当日盘中实时可用的行情。
+
+    前复权，约 9 个月窗口供长周期策略使用。
+    """
+    cutoff = trade_day - dt.timedelta(days=1)
+    start = (cutoff - dt.timedelta(days=270)).strftime("%Y%m%d")
+    end = cutoff.strftime("%Y%m%d")
     return get_kline(code, "daily", start, end)
 
 
 def run_replay(target_date: dt.date) -> dict:
-    """按所选日期，用已勾选策略盘点自选股信号，并写入日志/Excel/数据库（去重）。"""
-    result = {"computed": 0, "excel": 0, "db": 0, "last_bar": None}
+    """按所选日期，用已勾选策略盘点自选股信号，并写入日志/Excel/数据库（去重）。
+
+    与实时口径一致：交易日期记为所选日期，行情用该日期之前的日 K
+    （相当于当日盘中能拿到的数据），便于盘点结果与实时日志保持一致。
+    """
+    result = {"computed": 0, "excel": 0, "db": 0, "data_date": None}
     codes = list(st.session_state.get("watchlist", []))
     if not codes:
         return result
@@ -981,6 +989,19 @@ def run_replay(target_date: dt.date) -> dict:
     )
     logged = st.session_state.setdefault("replay_logged_keys", set())
     entries = []
+    trade_date = target_date.strftime("%Y-%m-%d")
+
+    data_dates = []
+    for code in codes:
+        try:
+            daily = load_kline_before(code, target_date)
+        except Exception:
+            continue
+        if daily is not None and not daily.empty:
+            data_dates.append(
+                pd.to_datetime(daily["日期"].iloc[-1]).strftime("%Y-%m-%d")
+            )
+    result["data_date"] = max(data_dates) if data_dates else None
 
     for strategy, signal_fn in STRATEGY_RUNNERS.items():
         idx = QUANT_STRATEGIES.index(strategy)
@@ -989,7 +1010,7 @@ def run_replay(target_date: dt.date) -> dict:
         color = strategies.STRATEGY_COLORS[strategy]
         for code in codes:
             try:
-                daily = load_kline_until(code, target_date)
+                daily = load_kline_before(code, target_date)
                 action = signal_fn(daily)
             except Exception:
                 continue
@@ -998,19 +1019,14 @@ def run_replay(target_date: dt.date) -> dict:
             price = to_float(daily["收盘"].iloc[-1])
             if price is None:
                 continue
-            bar_date = pd.to_datetime(daily["日期"].iloc[-1]).strftime("%Y-%m-%d")
-            result["last_bar"] = (
-                bar_date if result["last_bar"] is None
-                else max(result["last_bar"], bar_date)
-            )
             stock_name = names.get(code, code)
-            log_key = f"{strategy}-{code}-{action}-{bar_date}"
+            log_key = f"{strategy}-{code}-{action}-{trade_date}"
             if log_key not in logged:
                 logged.add(log_key)
                 add_log(
                     strategies.format_signal_log(
                         strategy, stock_name, action, f"{price:.2f}",
-                        SIGNAL_QUANTITY, "15:00:00", bar_date,
+                        SIGNAL_QUANTITY, "15:00:00", trade_date,
                     ),
                     level="trade",
                     color=color,
@@ -1022,7 +1038,7 @@ def run_replay(target_date: dt.date) -> dict:
                 "price": price,
                 "quantity": SIGNAL_QUANTITY,
                 "time": "15:00:00",
-                "date": bar_date,
+                "date": trade_date,
             })
 
     result["computed"] = len(entries)
@@ -1308,16 +1324,17 @@ def render_quant_strategy_box() -> None:
             else:
                 with st.spinner("盘点中…"):
                     stats = run_replay(replay_date)
+                data_date = stats.get("data_date") or "--"
                 if stats["computed"] == 0:
-                    st.info(f"盘点完成：{replay_date} 没有产生交易信号。")
+                    st.info(
+                        f"盘点完成：{replay_date} 没有产生交易信号"
+                        f"（行情数据截至 {data_date}）。"
+                    )
                 else:
-                    note = ""
-                    if (stats["last_bar"]
-                            and stats["last_bar"] != replay_date.strftime("%Y-%m-%d")):
-                        note = f"（所选日期非交易日，按最近交易日 {stats['last_bar']} 计算）"
                     st.success(
                         f"盘点完成：生成 {stats['computed']} 条信号，"
-                        f"新增入库 Excel {stats['excel']} 条 / 数据库 {stats['db']} 条{note}"
+                        f"新增入库 Excel {stats['excel']} 条 / 数据库 {stats['db']} 条"
+                        f"（行情数据截至 {data_date}，交易日期记为 {replay_date}）"
                     )
         if st.button("清除数据", key="clear_btn"):
             try:
@@ -1328,7 +1345,8 @@ def render_quant_strategy_box() -> None:
             except Exception as exc:
                 st.error(f"清除失败：{exc}")
         st.caption(
-            "盘点按所选交易日收盘数据计算，提示时间记为 15:00:00；"
+            "盘点使用所选日期之前的日 K 线（模拟当日盘中可获取的行情），"
+            "交易日期记为所选日期，提示时间记为 15:00:00；"
             "清除数据会删除 Excel 与数据库中的全部交易记录。"
         )
 
