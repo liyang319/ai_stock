@@ -23,6 +23,7 @@ from plotly.subplots import make_subplots
 from pypinyin import Style, lazy_pinyin
 from streamlit_sortables import sort_items
 
+import db_log
 import excel_log
 import strategies
 import strategy_bollinger
@@ -953,6 +954,10 @@ def run_enabled_strategies(snapshot: dict) -> None:
             excel_log.append_trade_logs(trade_entries)
         except Exception as exc:
             add_log(f"Excel 交易日志写入失败：{exc}", "debug")
+        try:
+            db_log.append_trade_logs(trade_entries)
+        except Exception as exc:
+            add_log(f"SQLite 交易日志写入失败：{exc}", "debug")
 
 
 def refresh_snapshots() -> None:
@@ -1263,6 +1268,13 @@ def main() -> None:
             st.session_state["excel_ready"] = True
         except Exception as exc:
             add_log(f"Excel 交易日志创建失败：{exc}", "debug")
+
+    if not st.session_state.get("db_ready"):
+        try:
+            db_log.ensure_database()
+            st.session_state["db_ready"] = True
+        except Exception as exc:
+            add_log(f"SQLite 交易日志创建失败：{exc}", "debug")
 
     if "index_snapshot" not in st.session_state:
         st.session_state["index_snapshot"] = collect_index_snapshot()
