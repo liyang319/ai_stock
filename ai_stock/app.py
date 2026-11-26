@@ -89,7 +89,7 @@ MA_PERIODS = (5, 10, 20, 30)
 MA_COLORS = {5: "#9e9e9e", 10: "#e6a700", 20: "#d000d0", 30: "#00a651"}
 PERIOD_UNITS = {"日K": "日", "周K": "周", "月K": "月"}
 
-LOG_COLORS = {"info": "#3b82f6", "success": "#1aa260", "warning": "#f59e0b", "error": "#e5333c"}
+LOG_COLORS = {"info": "#111111", "debug": "#1e3a8a", "trade": "#111111"}
 LOG_MAX_ENTRIES = 100
 
 WATCHLIST_FILE = Path(
@@ -202,7 +202,7 @@ def add_to_watchlist(code: str) -> None:
     if code not in st.session_state.watchlist:
         st.session_state.watchlist.append(code)
         save_watchlist(st.session_state.watchlist)
-        add_log(f"添加自选 {code}", "success")
+        add_log(f"添加自选 {code}", "info")
 
 
 def remove_from_watchlist(code: str) -> None:
@@ -210,7 +210,7 @@ def remove_from_watchlist(code: str) -> None:
         c for c in st.session_state.watchlist if c != code
     ]
     save_watchlist(st.session_state.watchlist)
-    add_log(f"移除自选 {code}", "warning")
+    add_log(f"移除自选 {code}", "info")
 
 
 # ---------------------------------------------------------------- 数据接口
@@ -920,11 +920,14 @@ def run_enabled_strategies(snapshot: dict) -> None:
             if signal_key in seen:
                 continue
             seen.add(signal_key)
+            price = to_float(daily["收盘"].iloc[-1])
+            price_txt = f"{price:.2f}" if price is not None else "--"
             add_log(
                 strategies.format_signal_log(
-                    strategy, names.get(code, code), action,
+                    strategy, names.get(code, code), action, price_txt,
                     SIGNAL_QUANTITY, dt.datetime.now().strftime("%H:%M:%S"),
                 ),
+                level="trade",
                 color=color,
             )
 
@@ -1094,15 +1097,30 @@ def render_system_log_panel() -> None:
                 return
             rows = []
             for entry in reversed(logs[-60:]):
-                color = entry.get("color") or LOG_COLORS.get(entry["level"], "#9aa0a6")
+                level = entry.get("level", "info")
+                strategy_color = entry.get("color") if level == "trade" else None
+                dot_color = strategy_color or LOG_COLORS.get(level, "#111111")
+                message = entry["message"]
+                if (level == "trade" and strategy_color
+                        and message.startswith("[") and "]" in message):
+                    split = message.index("]") + 1
+                    text_html = (
+                        f"<span style='color:{strategy_color};font-weight:600'>"
+                        f"{html.escape(message[:split])}</span>"
+                        f"<span style='color:#111111'>{html.escape(message[split:])}</span>"
+                    )
+                else:
+                    text_html = f"<span style='color:#111111'>{html.escape(message)}</span>"
                 rows.append(
                     "<div style='display:flex;gap:8px;align-items:flex-start;"
                     "padding:6px 4px;border-bottom:1px dashed #ececec'>"
-                    f"<span style='color:#9aa0a6;font-size:0.72rem;"
-                    f"font-family:ui-monospace,monospace;padding-top:2px'>{entry['time']}</span>"
-                    f"<span style='color:{color};font-size:0.72rem;line-height:1.5'>●</span>"
-                    f"<span style='color:#333;font-size:0.8rem;line-height:1.5;"
-                    f"word-break:break-all'>{html.escape(entry['message'])}</span></div>"
+                    f"<span style='color:#9aa0a6;font-size:0.7rem;"
+                    f"font-family:ui-monospace,monospace;padding-top:2px;"
+                    f"white-space:nowrap'>{entry['time']}</span>"
+                    f"<span style='color:{dot_color};font-size:0.72rem;"
+                    f"line-height:1.5'>●</span>"
+                    f"<span style='font-size:0.78rem;line-height:1.5'>{text_html}</span>"
+                    "</div>"
                 )
             st.markdown("".join(rows), unsafe_allow_html=True)
 
@@ -1118,7 +1136,7 @@ def render_quant_strategy_box() -> None:
     """独立 fragment：勾选策略只重跑本区域，不触发整页重跑（避免全页发白）。"""
     with st.container(border=True, key="quant_strategies"):
         st.subheader("量化策略")
-        st.caption("勾选需要关注的策略（双均线交叉已接入，其余算法待实现）")
+        st.caption("勾选需要关注的策略，交易信号将显示在右侧系统日志中")
         all_selected = all(
             st.session_state.get(f"strategy_{i}", False)
             for i in range(len(QUANT_STRATEGIES))
@@ -1171,7 +1189,7 @@ def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> 
     updated = snapshot.get("updated")
     stamp = f"{updated:%H:%M:%S}" if updated else "--"
 
-    main_col, log_col = st.columns([3.3, 1], gap="medium")
+    main_col, log_col = st.columns([2.4, 1.6], gap="medium")
 
     with main_col:
         if not codes:
@@ -1208,8 +1226,11 @@ def main() -> None:
 
     if "system_logs" not in st.session_state:
         st.session_state.system_logs = []
-        add_log("行情服务已连接，自选看板就绪", "success")
-        add_log("量化信号模块待接入，交易提示将显示在此", "info")
+        add_log("行情服务已连接，自选看板就绪", "info")
+        add_log(
+            f"策略引擎初始化完成，已注册 {len(STRATEGY_RUNNERS)} 个量化策略",
+            "debug",
+        )
 
     if "index_snapshot" not in st.session_state:
         st.session_state["index_snapshot"] = collect_index_snapshot()
