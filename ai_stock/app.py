@@ -778,10 +778,11 @@ def apply_sort_order(stock_index: pd.DataFrame) -> None:
         labels,
         direction="horizontal",
         custom_style=(
-            ".sortable-container-body{display:flex;flex-wrap:wrap;"
+            ".sortable-container-body{display:flex;flex-wrap:wrap;gap:8px;"
             "background:transparent;padding:0;min-height:auto}"
             ".sortable-item,.sortable-item:hover,.sortable-item:active{"
-            "border-radius:999px;padding:2px 12px;margin:4px;"
+            "border-radius:10px;padding:6px 10px;margin:0;"
+            "width:calc((100% - 16px)/3);box-sizing:border-box;text-align:center;"
             "font-size:0.9rem;background:#eef1f6;color:#333;white-space:nowrap;"
             "box-shadow:none}"
         ),
@@ -1307,6 +1308,26 @@ def run_replay(target_date: dt.date) -> dict:
     return result
 
 
+def _replay_result_message(stats: dict, replay_date) -> str:
+    data_date = stats.get("data_date") or "--"
+    if stats["computed"] == 0:
+        return (
+            f"盘点完成：{replay_date} 没有产生交易信号"
+            f"（日线历史截至 {data_date}）。"
+        )
+    extra = f"（日线历史截至 {data_date}"
+    if stats["fallback"]:
+        extra += (
+            f"，{stats['fallback']} 只股票无当日分钟数据，"
+            "交易时间按 15:00:00 记录"
+        )
+    extra += "）"
+    return (
+        f"盘点完成：生成 {stats['computed']} 条信号，已写入盘点暂存文件"
+        f"{extra}；可在下方「交易数据」面板合并或查看。"
+    )
+
+
 def refresh_snapshots() -> None:
     """不可见的定时刷新：耗时请求与可见渲染分离，避免刷新时整块区域发白卡顿。"""
     st.session_state["index_snapshot"] = collect_index_snapshot()
@@ -1478,12 +1499,13 @@ def render_index_panel() -> None:
         st.warning("；".join(errors))
 
 
-def render_system_log_panel() -> None:
+def render_system_log_panel(rows: int = 1) -> None:
     logs = st.session_state.get("system_logs", [])
+    inner_height = max(300, rows * 463 + (rows - 1) * 16 - 92)
     with st.container(border=True, key="system_log_panel"):
         st.markdown("#### :material/terminal: 系统日志")
         st.caption("量化信号与系统事件")
-        with st.container(height=520, border=False):
+        with st.container(height=inner_height, border=False):
             if not logs:
                 st.caption("暂无日志")
                 return
@@ -1686,28 +1708,15 @@ def render_quant_strategy_box() -> None:
             elif not selected:
                 st.info("请先勾选至少一个量化策略。")
             else:
-                with st.spinner("盘点中…"):
-                    stats = run_replay(replay_date)
-                data_date = stats.get("data_date") or "--"
-                if stats["computed"] == 0:
-                    st.session_state["replay_done_msg"] = (
-                        f"盘点完成：{replay_date} 没有产生交易信号"
-                        f"（日线历史截至 {data_date}）。"
-                    )
-                else:
-                    extra = f"（日线历史截至 {data_date}"
-                    if stats["fallback"]:
-                        extra += (
-                            f"，{stats['fallback']} 只股票无当日分钟数据，"
-                            "交易时间按 15:00:00 记录"
-                        )
-                    extra += "）"
-                    st.session_state["replay_done_msg"] = (
-                        f"盘点完成：生成 {stats['computed']} 条信号，已写入盘点暂存文件"
-                        f"{extra}；可在下方「交易数据」面板合并或查看。"
-                    )
-                # 触发整页刷新，让下方「交易数据」视图同步显示临时盘点数据
+                # 先整页刷新，把耗时的分钟级回放放到页面渲染完成之后执行，
+                # 避免盘点期间整页发白/无响应。
+                st.session_state["pending_replay"] = replay_date
                 st.rerun(scope="app")
+        if st.session_state.get("pending_replay"):
+            st.info(
+                f"正在盘点 {st.session_state['pending_replay']}，"
+                "计算完成后会自动刷新「交易数据」。"
+            )
         replay_done_msg = st.session_state.pop("replay_done_msg", None)
         if replay_done_msg:
             st.success(replay_done_msg)
@@ -1880,7 +1889,7 @@ def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> 
             st.caption(f"自选图表更新于 {stamp}")
 
     with log_col:
-        render_system_log_panel()
+        render_system_log_panel(max(1, (len(codes) + 2) // 3))
 
 
 def main() -> None:
@@ -1921,7 +1930,6 @@ def main() -> None:
         refresh_frag = st.fragment(refresh_snapshots, run_every=refresh)
         index_panel = st.fragment(render_index_panel, run_every=refresh)
         watch_panel = st.fragment(render_watch_panel, run_every=refresh)
-        refresh_frag()
     else:
         refresh_snapshots()
         index_panel = render_index_panel
@@ -1976,6 +1984,19 @@ def main() -> None:
     st.session_state["panel_params"] = (chart_type, period_label, range_label)
     ensure_watch_snapshot(chart_type, period_label, range_label)
     watch_panel(chart_type, period_label, range_label)
+
+    # 页面渲染完成后再执行耗时的数据刷新，避免整页发白
+    if refresh:
+        refresh_frag()
+
+    # 盘点计算同样放到最后执行，完成后整页刷新显示结果
+    pending_replay = st.session_state.pop("pending_replay", None)
+    if pending_replay:
+        stats = run_replay(pending_replay)
+        st.session_state["replay_done_msg"] = _replay_result_message(
+            stats, pending_replay
+        )
+        st.rerun(scope="app")
 
 
 if __name__ == "__main__":
