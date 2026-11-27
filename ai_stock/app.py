@@ -157,6 +157,18 @@ def color_of(value) -> str:
     return UP_COLOR if value > 0 else DOWN_COLOR if value < 0 else FLAT_COLOR
 
 
+def is_trading_time(now: dt.datetime | None = None) -> bool:
+    """A 股交易时段（工作日 09:30-11:30、13:00-15:00）。"""
+    now = now or dt.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    clock = now.time()
+    return (
+        (dt.time(9, 30) <= clock <= dt.time(11, 30))
+        or (dt.time(13, 0) <= clock <= dt.time(15, 0))
+    )
+
+
 def parse_cn_amount(value):
     """解析「1.15亿」「9945.84万」「-3094.94万」这类中文金额为元。"""
     text = str(value).strip()
@@ -1050,7 +1062,13 @@ def ensure_watch_snapshot(chart_type: str, period_label: str, range_label: str) 
 
 
 def run_enabled_strategies(snapshot: dict) -> None:
-    """对已勾选的策略实时计算自选股信号，命中后写入系统日志（带策略专属颜色）。"""
+    """对已勾选的策略实时计算自选股信号，命中后写入系统日志（带策略专属颜色）。
+
+    仅在 A 股交易时段内产生实时信号；收盘后不再生成“实时”交易记录（历史信号
+    请使用「盘点数据」回放）。
+    """
+    if not is_trading_time():
+        return
     codes = list(st.session_state.get("watchlist", []))
     if not codes:
         return
@@ -1672,7 +1690,7 @@ def render_quant_strategy_box() -> None:
                     stats = run_replay(replay_date)
                 data_date = stats.get("data_date") or "--"
                 if stats["computed"] == 0:
-                    st.info(
+                    st.session_state["replay_done_msg"] = (
                         f"盘点完成：{replay_date} 没有产生交易信号"
                         f"（日线历史截至 {data_date}）。"
                     )
@@ -1684,14 +1702,19 @@ def render_quant_strategy_box() -> None:
                             "交易时间按 15:00:00 记录"
                         )
                     extra += "）"
-                    st.success(
+                    st.session_state["replay_done_msg"] = (
                         f"盘点完成：生成 {stats['computed']} 条信号，已写入盘点暂存文件"
                         f"{extra}；可在下方「交易数据」面板合并或查看。"
                     )
+                # 触发整页刷新，让下方「交易数据」视图同步显示临时盘点数据
+                st.rerun(scope="app")
+        replay_done_msg = st.session_state.pop("replay_done_msg", None)
+        if replay_done_msg:
+            st.success(replay_done_msg)
         st.caption(
             "盘点按所选交易日的分钟数据逐分钟回放（日线历史截至前一日），"
             "交易时间取首次满足买卖条件的时刻，无分钟数据时按 15:00:00 回退；"
-            "盘点结果先写入临时暂存文件，不污染实时数据。"
+            "盘点结果先写入临时暂存文件，不污染实时数据。实时信号仅在交易时段内产生。"
         )
 
 
