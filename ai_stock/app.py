@@ -40,7 +40,7 @@ import strategy_rsi
 import strategy_trend
 import strategy_turtle
 
-st.set_page_config(page_title="股票行情助手", page_icon="📈", layout="wide")
+st.set_page_config(page_title="老李股票行情助手", page_icon="📈", layout="wide")
 
 UP_COLOR = "#e5333c"      # 中国习惯：红涨
 DOWN_COLOR = "#1aa260"    # 绿跌
@@ -74,6 +74,15 @@ STRATEGY_RUNNERS = {
     "配对交易": strategy_pairs.pairs_signal,
 }
 
+# (外盘代码, 名称关键字, 显示名称)
+COMMODITIES = [
+    ("GC", "黄金", "黄金"),
+    ("SI", "白银", "白银"),
+    ("CL", "原油", "原油"),
+    ("NG", "天然气", "天然气"),
+    ("HG", "铜", "铜"),
+]
+
 # (接口类型, AKShare 代码, 显示代码, 显示名称)
 GLOBAL_INDEXES = [
     ("us", ".DJI", "DJI", "道琼斯"),
@@ -95,13 +104,23 @@ PERIOD_UNITS = {"日K": "日", "周K": "周", "月K": "月"}
 
 LOG_COLORS = {"info": "#111111", "debug": "#1e3a8a", "trade": "#111111"}
 LOG_MAX_ENTRIES = 100
+SOURCE_LIVE = excel_log.SOURCE_LIVE
+SOURCE_REPLAY = excel_log.SOURCE_REPLAY
 BTN_WIDTH = 170
 STORE_BUTTON_CSS = (
     "<style>"
-    ".st-key-clear_all_btn button, .st-key-backup_btn button {"
-    "background-color:#dbeafe;color:#1e3a8a;border:1px solid #93c5fd;}"
-    ".st-key-clear_all_btn button:hover, .st-key-backup_btn button:hover {"
-    "background-color:#bfdbfe;color:#1e3a8a;border-color:#60a5fa;}"
+    ".st-key-merge_temp_btn button{background-color:#dbeafe;color:#1e3a8a;border:1px solid #93c5fd;}"
+    ".st-key-merge_all_btn button{background-color:#dcfce7;color:#166534;border:1px solid #86efac;}"
+    ".st-key-backup_data_btn button{background-color:#fef9c3;color:#854d0e;border:1px solid #fde047;}"
+    ".st-key-clear_rt_btn button{background-color:#ffedd5;color:#9a3412;border:1px solid #fdba74;}"
+    ".st-key-clear_inv_btn button{background-color:#fee2e2;color:#991b1b;border:1px solid #fca5a5;}"
+    ".st-key-clear_all_btn button{background-color:#ede9fe;color:#5b21b6;border:1px solid #c4b5fd;}"
+    ".st-key-merge_temp_btn button:hover{background-color:#bfdbfe;}"
+    ".st-key-merge_all_btn button:hover{background-color:#bbf7d0;}"
+    ".st-key-backup_data_btn button:hover{background-color:#fef08a;}"
+    ".st-key-clear_rt_btn button:hover{background-color:#fed7aa;}"
+    ".st-key-clear_inv_btn button:hover{background-color:#fecaca;}"
+    ".st-key-clear_all_btn button:hover{background-color:#ddd6fe;}"
     "</style>"
 )
 
@@ -334,6 +353,31 @@ def get_global_index_spot() -> pd.DataFrame:
             })
         except Exception:
             continue
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_commodity_spot() -> pd.DataFrame:
+    """COMEX/NYMEX 主要物资实时行情（黄金、白银、原油、天然气、铜）。"""
+    df = ak.futures_foreign_commodity_realtime(
+        symbol=[symbol for symbol, _, _ in COMMODITIES]
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    for col in ("最新价", "涨跌额", "涨跌幅"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    rows = []
+    for symbol, keyword, label in COMMODITIES:
+        match = df[df["名称"].astype(str).str.contains(keyword, regex=False)]
+        if match.empty:
+            continue
+        r = match.iloc[0]
+        rows.append({
+            "代码": symbol, "名称": label,
+            "最新价": to_float(r.get("最新价")),
+            "涨跌额": to_float(r.get("涨跌额")),
+            "涨跌幅": to_float(r.get("涨跌幅")),
+        })
     return pd.DataFrame(rows)
 
 
@@ -784,6 +828,11 @@ def collect_index_snapshot() -> dict:
     except Exception as exc:
         global_spot = pd.DataFrame()
         errors.append(f"全球指数获取失败：{exc}")
+    try:
+        commodity_spot = get_commodity_spot()
+    except Exception as exc:
+        commodity_spot = pd.DataFrame()
+        errors.append(f"主要物资行情获取失败：{exc}")
 
     # 两市成交额优先取指数口径（上证指数 + 深证综指），与交易软件一致
     market_amount = None
@@ -859,6 +908,7 @@ def collect_index_snapshot() -> dict:
     return {
         "index_spot": index_spot,
         "global_spot": global_spot,
+        "commodity_spot": commodity_spot,
         "breadth": breadth,
         "breadth_source": breadth_source,
         "market_amount": market_amount,
@@ -960,7 +1010,7 @@ def run_enabled_strategies(snapshot: dict) -> None:
             add_log(
                 strategies.format_signal_log(
                     strategy, stock_name, action, price_txt,
-                    SIGNAL_QUANTITY, now, trade_date,
+                    SIGNAL_QUANTITY, now, trade_date, SOURCE_LIVE,
                 ),
                 level="trade",
                 color=color,
@@ -974,6 +1024,7 @@ def run_enabled_strategies(snapshot: dict) -> None:
                     "quantity": SIGNAL_QUANTITY,
                     "time": now,
                     "date": trade_date,
+                    "source": SOURCE_LIVE,
                 })
 
     if trade_entries:
@@ -1000,13 +1051,13 @@ def load_kline_before(code: str, trade_day: dt.date) -> pd.DataFrame:
 
 def _add_replay_entry(strategy, color, stock_name, code, action, price, when,
                       trade_date, logged, entries) -> None:
-    log_key = f"{strategy}-{code}-{action}-{trade_date}"
+    log_key = f"{strategy}-{code}-{action}-{trade_date}-{SOURCE_REPLAY}"
     if log_key not in logged:
         logged.add(log_key)
         add_log(
             strategies.format_signal_log(
                 strategy, stock_name, action, f"{price:.2f}",
-                SIGNAL_QUANTITY, when, trade_date,
+                SIGNAL_QUANTITY, when, trade_date, SOURCE_REPLAY,
             ),
             level="trade",
             color=color,
@@ -1019,6 +1070,7 @@ def _add_replay_entry(strategy, color, stock_name, code, action, price, when,
         "quantity": SIGNAL_QUANTITY,
         "time": when,
         "date": trade_date,
+        "source": SOURCE_REPLAY,
     })
 
 
@@ -1030,10 +1082,15 @@ def run_replay(target_date: dt.date) -> dict:
     无分钟数据（历史日期）时回退为日线信号，交易时间记为 15:00:00。
     """
     result = {"computed": 0, "excel": 0, "db": 0, "data_date": None,
-              "minute": 0, "fallback": 0}
+              "minute": 0, "fallback": 0, "temp_excel": None, "temp_db": None}
     codes = list(st.session_state.get("watchlist", []))
     if not codes:
         return result
+    # 每次盘点前删除旧 temp，并创建新的暂存文件
+    storage_backup.delete_temp_files()
+    temp = storage_backup.create_temp_files()
+    result["temp_excel"] = temp["excel"]
+    result["temp_db"] = temp["db"]
     snapshot = st.session_state.get("watch_snapshot", {})
     spot = snapshot.get("spot", pd.DataFrame())
     names = (
@@ -1137,13 +1194,17 @@ def run_replay(target_date: dt.date) -> dict:
     result["data_date"] = max(history_dates) if history_dates else None
     if entries:
         try:
-            result["excel"] = excel_log.append_trade_logs(entries, dedupe=True)
+            result["excel"] = excel_log.append_trade_logs(
+                entries, dedupe=True, path=temp["excel"]
+            )
         except Exception as exc:
-            add_log(f"Excel 盘点写入失败：{exc}", "debug")
+            add_log(f"盘点暂存 Excel 写入失败：{exc}", "debug")
         try:
-            result["db"] = db_log.append_trade_logs(entries, dedupe=True)
+            result["db"] = db_log.append_trade_logs(
+                entries, dedupe=True, path=temp["db"]
+            )
         except Exception as exc:
-            add_log(f"SQLite 盘点写入失败：{exc}", "debug")
+            add_log(f"盘点暂存数据库写入失败：{exc}", "debug")
     return result
 
 
@@ -1285,6 +1346,15 @@ def render_index_panel() -> None:
             "美股为最近收盘/盘中最新价，数据来源：新浪财经"
         )
 
+    commodity_spot = snapshot.get("commodity_spot", pd.DataFrame())
+    if not commodity_spot.empty:
+        items = [(symbol, label) for symbol, _, label in COMMODITIES]
+        render_index_cards(commodity_spot, items)
+        st.caption(
+            f"主要物资价格更新于 {stamp}　"
+            "COMEX/NYMEX 期货，数据来源：新浪财经"
+        )
+
     breadth = snapshot.get("breadth")
     if breadth:
         render_market_breadth(
@@ -1348,40 +1418,94 @@ def _toggle_all_strategies() -> None:
         st.session_state[f"strategy_{i}"] = value
 
 
-def _perform_backup_clear() -> str:
-    info = storage_backup.backup_and_clear()
+def _do_backup() -> str:
+    info = storage_backup.backup_data()
+    return f"已备份 {len(info['files'])} 个文件到 {info['folder'].name} 文件夹"
+
+
+def _do_clear_realtime() -> str:
+    storage_backup.clear_realtime()
     st.session_state.pop("replay_logged_keys", None)
-    return f"已备份到 {info['folder'].name} 文件夹，并清空当前数据"
+    return "已清空实时数据（保留盘点数据与历史备份）"
 
 
-def _perform_clear_all() -> str:
-    info = storage_backup.clear_all()
+def _do_clear_inventory() -> str:
+    storage_backup.clear_inventory()
     st.session_state.pop("replay_logged_keys", None)
-    return f"已删除 {info['files']} 个备份文件，并清空当前数据"
+    return "已清空盘点数据与临时盘点文件（保留实时数据与历史备份）"
 
 
-@st.dialog("确认备份并清空当前数据")
-def _dialog_backup_clear() -> None:
-    st.warning("将把当前 ai_stock.xlsx / ai_stock.db 备份到日期文件夹，然后清空当前数据。")
+def _do_clear_all() -> str:
+    removed = storage_backup.clear_all_data()
+    st.session_state.pop("replay_logged_keys", None)
+    return f"已清空实时与盘点数据（含 {removed} 个临时盘点文件），历史备份保留"
+
+
+def _do_merge_temp() -> str:
+    temp = storage_backup.current_temp()
+    if not temp:
+        return "没有待合并的盘点暂存文件"
+    rows = db_log.read_trades(temp["db"])
+    if not rows:
+        storage_backup.delete_temp_files()
+        return "盘点暂存文件为空，已删除临时文件"
+    entries = [dict(row) for row in rows]
+    excel_n = excel_log.append_trade_logs(
+        entries, dedupe=True, path=excel_log.INVENTORY_FILE
+    )
+    db_n = db_log.append_trade_logs(
+        entries, dedupe=True, path=db_log.INVENTORY_DB
+    )
+    storage_backup.delete_temp_files()
+    return (
+        f"盘点数据合并完成：新增入库 Excel {excel_n} 条 / 数据库 {db_n} 条，"
+        "已删除临时文件"
+    )
+
+
+def _do_merge_all() -> str:
+    excel_n = excel_log.rebuild_merge()
+    db_n = db_log.rebuild_merge()
+    return f"所有数据合并完成：merge sheet {excel_n} 条 / merge 表 {db_n} 条"
+
+
+@st.dialog("确认清空实时数据")
+def _dialog_clear_realtime() -> None:
+    st.warning("将清空 ai_stock.xlsx / ai_stock.db 的全部实时数据，并删除已生成的 merge 结果。")
     c1, c2 = st.columns(2)
-    if c1.button("确认备份并清空", type="primary", key="confirm_backup_btn", width="stretch"):
+    if c1.button("确认清空实时数据", type="primary", key="confirm_clear_rt_btn", width="stretch"):
         try:
-            msg = _perform_backup_clear()
+            msg = _do_clear_realtime()
         except Exception as exc:
-            msg = f"备份失败：{exc}"
+            msg = f"清空实时数据失败：{exc}"
         st.session_state["store_action_msg"] = msg
         st.rerun()
-    if c2.button("取消", key="cancel_backup_btn", width="stretch"):
+    if c2.button("取消", key="cancel_clear_rt_btn", width="stretch"):
+        st.rerun()
+
+
+@st.dialog("确认清空盘点数据")
+def _dialog_clear_inventory() -> None:
+    st.warning("将清空 ai_stock_inventory.xlsx / .db 的盘点数据、删除临时盘点文件，并删除 merge 结果。")
+    c1, c2 = st.columns(2)
+    if c1.button("确认清空盘点数据", type="primary", key="confirm_clear_inv_btn", width="stretch"):
+        try:
+            msg = _do_clear_inventory()
+        except Exception as exc:
+            msg = f"清空盘点数据失败：{exc}"
+        st.session_state["store_action_msg"] = msg
+        st.rerun()
+    if c2.button("取消", key="cancel_clear_inv_btn", width="stretch"):
         st.rerun()
 
 
 @st.dialog("确认清空所有数据")
 def _dialog_clear_all() -> None:
-    st.warning("将删除所有备份文件，并清空当前 Excel 与数据库数据，且不可恢复。")
+    st.warning("将清空实时数据、盘点数据与临时盘点文件（历史备份文件夹保留）。")
     c1, c2 = st.columns(2)
     if c1.button("确认清空所有", type="primary", key="confirm_clear_all_btn", width="stretch"):
         try:
-            msg = _perform_clear_all()
+            msg = _do_clear_all()
         except Exception as exc:
             msg = f"清空失败：{exc}"
         st.session_state["store_action_msg"] = msg
@@ -1474,26 +1598,146 @@ def render_quant_strategy_box() -> None:
                         )
                     extra += "）"
                     st.success(
-                        f"盘点完成：生成 {stats['computed']} 条信号，"
-                        f"新增入库 Excel {stats['excel']} 条 / 数据库 {stats['db']} 条"
-                        f"{extra}"
+                        f"盘点完成：生成 {stats['computed']} 条信号，已写入盘点暂存文件"
+                        f"{extra}；可在下方「交易数据」面板合并或查看。"
                     )
-        st.markdown(STORE_BUTTON_CSS, unsafe_allow_html=True)
-        clear_col, backup_col = st.columns(2)
-        if clear_col.button("清空所有数据", key="clear_all_btn", width=BTN_WIDTH):
-            _dialog_clear_all()
-        if backup_col.button(
-            "备份并清空当前数据", key="backup_btn", width=BTN_WIDTH
-        ):
-            _dialog_backup_clear()
-        action_msg = st.session_state.pop("store_action_msg", None)
-        if action_msg:
-            st.success(action_msg)
         st.caption(
             "盘点按所选交易日的分钟数据逐分钟回放（日线历史截至前一日），"
             "交易时间取首次满足买卖条件的时刻，无分钟数据时按 15:00:00 回退；"
-            "「备份并清空」会把当前文件备份到以日期命名的文件夹后清空，"
-            "「清空所有数据」会删除全部备份并清空当前数据。"
+            "盘点结果先写入临时暂存文件，不污染实时数据。"
+        )
+
+
+def _render_trade_table(view: pd.DataFrame) -> None:
+    """交易列表（HTML 表格）：策略名用策略色、买卖红绿、表头与内容居中。"""
+    columns = ["量化策略名称", "股票名称", "买卖", "当前交易价格",
+               "数量", "交易时间", "交易日期", "来源"]
+    th_style = (
+        "position:sticky;top:0;background:#f7f8fa;padding:6px 8px;"
+        "border-bottom:1px solid #e5e7eb;font-weight:600;text-align:center;"
+        "white-space:nowrap;z-index:1"
+    )
+    header = "".join(
+        f"<th style='{th_style}'>{html.escape(col)}</th>" for col in columns
+    )
+    body_rows = []
+    for idx, (_, row) in enumerate(view.iterrows()):
+        strategy = str(row["量化策略名称"])
+        strategy_color = strategies.STRATEGY_COLORS.get(strategy, "#111111")
+        action = str(row["买卖"])
+        action_color = (
+            UP_COLOR if action == "买"
+            else DOWN_COLOR if action == "卖" else "#111111"
+        )
+        price = to_float(row["当前交易价格"])
+        quantity = to_float(row["数量"])
+        price_txt = f"{price:.2f}" if price is not None else "--"
+        qty_txt = f"{int(quantity)}" if quantity is not None else "--"
+        bg = "#ffffff" if idx % 2 == 0 else "#fafbfc"
+        td = f"padding:5px 8px;border-bottom:1px solid #f0f0f0;text-align:center;background:{bg}"
+        cells = (
+            f"<td style=\"{td};color:{strategy_color};font-weight:600\">"
+            f"{html.escape(strategy)}</td>"
+            f"<td style='{td}'>{html.escape(str(row['股票名称']))}</td>"
+            f"<td style=\"{td};color:{action_color};font-weight:600\">"
+            f"{html.escape(action)}</td>"
+            f"<td style='{td}'>{price_txt}</td>"
+            f"<td style='{td}'>{qty_txt}</td>"
+            f"<td style='{td}'>{html.escape(str(row['交易时间']))}</td>"
+            f"<td style='{td}'>{html.escape(str(row['交易日期']))}</td>"
+            f"<td style='{td}'>{html.escape(str(row['来源']))}</td>"
+        )
+        body_rows.append(f"<tr>{cells}</tr>")
+    st.markdown(
+        "<div style='max-height:420px;overflow:auto;border:1px solid #e5e7eb;"
+        "border-radius:8px'><table style='width:100%;border-collapse:collapse;"
+        "font-size:0.84rem'>"
+        f"<thead><tr>{header}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+@st.fragment
+def render_trade_data_panel() -> None:
+    """交易数据统计视图：按日期/来源/策略筛选，并管理盘点暂存与合并。"""
+    st.markdown(STORE_BUTTON_CSS, unsafe_allow_html=True)
+    with st.container(border=True, key="trade_data_panel"):
+        st.subheader("交易数据")
+        rows = [dict(r) for r in db_log.read_trades(db_log.MAIN_DB)]
+        rows += [dict(r) for r in db_log.read_trades(db_log.INVENTORY_DB)]
+        temp = storage_backup.current_temp()
+        if temp:
+            rows += [dict(r) for r in db_log.read_trades(temp["db"])]
+
+        if not rows:
+            st.caption("暂无交易数据。完成盘点并合并后可在此查看。")
+        else:
+            df = pd.DataFrame(rows).rename(columns={
+                "strategy": "量化策略名称", "stock": "股票名称",
+                "action": "买卖", "price": "当前交易价格", "quantity": "数量",
+                "time": "交易时间", "date": "交易日期", "source": "来源",
+            })
+            dates = sorted(df["交易日期"].astype(str).unique(), reverse=True)
+            f1, f2, f3 = st.columns([1.3, 1, 1.3])
+            date_sel = f1.selectbox("交易日期", ["全部"] + dates, key="stats_date")
+            source_sel = f2.selectbox(
+                "来源", ["全部", SOURCE_LIVE, SOURCE_REPLAY], key="stats_source"
+            )
+            strategy_sel = f3.selectbox(
+                "策略", ["全部"] + QUANT_STRATEGIES, key="stats_strategy"
+            )
+            view = df
+            if date_sel != "全部":
+                view = view[view["交易日期"].astype(str) == date_sel]
+            if source_sel != "全部":
+                view = view[view["来源"] == source_sel]
+            if strategy_sel != "全部":
+                view = view[view["量化策略名称"] == strategy_sel]
+
+            price = pd.to_numeric(view["当前交易价格"], errors="coerce")
+            quantity = pd.to_numeric(view["数量"], errors="coerce")
+            buys = int((view["买卖"] == "买").sum())
+            sells = int((view["买卖"] == "卖").sum())
+            amount = float((price.fillna(0) * quantity.fillna(0)).sum())
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("交易总数", f"{len(view)} 笔")
+            m2.metric("买入", f"{buys} 笔")
+            m3.metric("卖出", f"{sells} 笔")
+            m4.metric("涉及股票", f"{int(view['股票名称'].nunique())} 只")
+            m5.metric("成交金额", fmt_amount(amount))
+
+            if view.empty:
+                st.caption("当前筛选条件下没有数据。")
+            else:
+                _render_trade_table(view)
+
+        st.divider()
+        row1 = st.columns(3)
+        if row1[0].button("盘点数据合并", key="merge_temp_btn", width="stretch"):
+            st.session_state["store_action_msg"] = _do_merge_temp()
+            st.rerun()
+        if row1[1].button("所有数据合并", key="merge_all_btn", width="stretch"):
+            st.session_state["store_action_msg"] = _do_merge_all()
+            st.rerun()
+        if row1[2].button("备份数据", key="backup_data_btn", width="stretch"):
+            st.session_state["store_action_msg"] = _do_backup()
+            st.rerun()
+        row2 = st.columns(3)
+        if row2[0].button("清空实时数据", key="clear_rt_btn", width="stretch"):
+            _dialog_clear_realtime()
+        if row2[1].button("清空盘点数据", key="clear_inv_btn", width="stretch"):
+            _dialog_clear_inventory()
+        if row2[2].button("清空所有数据", key="clear_all_btn", width="stretch"):
+            _dialog_clear_all()
+
+        msg = st.session_state.pop("store_action_msg", None)
+        if msg:
+            st.success(msg)
+        st.caption(
+            "「盘点数据合并」：临时文件 → ai_stock_inventory.*；"
+            "「所有数据合并」：重建 ai_stock.xlsx 的 merge sheet 与 "
+            "ai_stock.db 的 merge 表（实时优先去重）；实时与盘点数据保持隔离。"
         )
 
 
@@ -1532,7 +1776,7 @@ def render_watch_panel(chart_type: str, period_label: str, range_label: str) -> 
 def main() -> None:
     title_col, refresh_col = st.columns([4.5, 1], vertical_alignment="bottom")
     with title_col:
-        st.title("📈 股票行情助手")
+        st.title("📈 老李股票行情助手")
     with refresh_col:
         refresh_label = st.selectbox("自动刷新", list(REFRESH_OPTIONS.keys()), index=2)
 
@@ -1549,19 +1793,16 @@ def main() -> None:
             "debug",
         )
 
-    if not st.session_state.get("excel_ready"):
+    if not st.session_state.get("store_ready"):
         try:
-            excel_log.ensure_workbook()
-            st.session_state["excel_ready"] = True
+            storage_backup.delete_temp_files()
+            excel_log.ensure_workbook(excel_log.MAIN_FILE)
+            excel_log.ensure_workbook(excel_log.INVENTORY_FILE)
+            db_log.ensure_database(db_log.MAIN_DB)
+            db_log.ensure_database(db_log.INVENTORY_DB)
+            st.session_state["store_ready"] = True
         except Exception as exc:
-            add_log(f"Excel 交易日志创建失败：{exc}", "debug")
-
-    if not st.session_state.get("db_ready"):
-        try:
-            db_log.ensure_database()
-            st.session_state["db_ready"] = True
-        except Exception as exc:
-            add_log(f"SQLite 交易日志创建失败：{exc}", "debug")
+            add_log(f"交易数据文件创建失败：{exc}", "debug")
 
     if "index_snapshot" not in st.session_state:
         st.session_state["index_snapshot"] = collect_index_snapshot()
@@ -1620,6 +1861,7 @@ def main() -> None:
             apply_sort_order(stock_index)
 
     render_quant_strategy_box()
+    render_trade_data_panel()
 
     st.session_state["panel_params"] = (chart_type, period_label, range_label)
     ensure_watch_snapshot(chart_type, period_label, range_label)

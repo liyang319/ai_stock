@@ -24,9 +24,9 @@ STRATEGY_NAMES = list(STRATEGY_COLORS.keys())
 
 def format_signal_log(strategy: str, stock: str, action: str,
                       price: str, quantity: int, when: str,
-                      trade_date: str) -> str:
-    """生成策略日志：策略-股票-买卖-当前价格-数量-交易时间-交易日期。"""
+                      trade_date: str, source: str) -> str:
+    """生成策略日志：策略-股票-买卖-当前价格-数量-交易时间-交易日期-来源。"""
     return (
         f"[{strategy}]-[{stock}]-[{action}]-[{price}]-[{quantity}股]"
-        f"-[交易时间: {when}]-[{trade_date}]"
+        f"-[交易时间: {when}]-[{trade_date}]-[{source}]"
     )

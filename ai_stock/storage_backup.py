@@ -1,4 +1,4 @@
-"""交易数据备份与清空：按日期文件夹备份 ai_stock.xlsx / ai_stock.db。"""
+"""交易数据备份、清空，以及盘点暂存（temp）文件管理。"""
 
 import re
 import shutil
@@ -11,21 +11,65 @@ import excel_log
 
 _LOCK = threading.Lock()
 _DATE_DIR = re.compile(r"^\d{8}$")
+_TEMP_FILE = re.compile(r"^ai_stock_inventory_\d{8}_\d{6}_temp\.(xlsx|db)$")
 
 
 def _base_dir() -> Path:
-    return excel_log.EXCEL_FILE.parent
+    return excel_log.MAIN_FILE.parent
 
 
-def backup_and_clear() -> dict:
-    """把当前 Excel/DB 备份到日期文件夹（文件名含备份时间），再重建空文件。"""
+def temp_files() -> list[Path]:
+    return sorted(
+        p for p in _base_dir().iterdir()
+        if p.is_file() and _TEMP_FILE.fullmatch(p.name)
+    )
+
+
+def current_temp() -> dict | None:
+    files = temp_files()
+    if not files:
+        return None
+    excel = next((p for p in files if p.suffix == ".xlsx"), None)
+    db = next((p for p in files if p.suffix == ".db"), None)
+    if not excel or not db:
+        return None
+    return {"excel": excel, "db": db}
+
+
+def create_temp_files() -> dict:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = _base_dir()
+    excel = base / f"ai_stock_inventory_{stamp}_temp.xlsx"
+    db = base / f"ai_stock_inventory_{stamp}_temp.db"
+    excel_log.ensure_workbook(excel)
+    db_log.ensure_database(db)
+    return {"excel": excel, "db": db, "stamp": stamp}
+
+
+def delete_temp_files() -> int:
+    removed = 0
+    for path in temp_files():
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def backup_data() -> dict:
+    """备份主文件与盘点归档文件到日期文件夹（不删除、不清空）。"""
     now = datetime.now()
     stamp = now.strftime("%Y%m%d_%H%M%S")
     folder = _base_dir() / now.strftime("%Y%m%d")
-    moved = []
+    copied = []
     with _LOCK:
         folder.mkdir(parents=True, exist_ok=True)
-        for path in (excel_log.EXCEL_FILE, db_log.DB_FILE):
+        sources = (
+            excel_log.MAIN_FILE, excel_log.INVENTORY_FILE,
+            db_log.MAIN_DB, db_log.INVENTORY_DB,
+        )
+        for path in sources:
             if not path.exists():
                 continue
             target = folder / f"{path.stem}_{stamp}{path.suffix}"
@@ -33,40 +77,27 @@ def backup_and_clear() -> dict:
             while target.exists():
                 target = folder / f"{path.stem}_{stamp}_{counter}{path.suffix}"
                 counter += 1
-            shutil.move(str(path), str(target))
-            moved.append(target)
-        excel_log.ensure_workbook()
-        db_log.ensure_database()
-    return {"folder": folder, "moved": moved}
+            shutil.copy2(path, target)
+            copied.append(target)
+    return {"folder": folder, "files": copied}
 
 
-def clear_all() -> dict:
-    """删除所有日期文件夹内的备份文件，并清空当前 Excel/数据库数据。"""
-    removed_files = 0
-    removed_dirs = 0
-    stems = {excel_log.EXCEL_FILE.stem, db_log.DB_FILE.stem}
-    suffixes = {excel_log.EXCEL_FILE.suffix, db_log.DB_FILE.suffix}
+def clear_realtime() -> None:
+    excel_log.clear_data(excel_log.MAIN_FILE)
+    db_log.clear_data(db_log.MAIN_DB)
 
-    def is_backup(file: Path) -> bool:
-        return (
-            file.is_file()
-            and file.suffix in suffixes
-            and any(file.name.startswith(f"{stem}_") for stem in stems)
-        )
 
-    with _LOCK:
-        for child in _base_dir().iterdir():
-            if not (child.is_dir() and _DATE_DIR.fullmatch(child.name)):
-                continue
-            for file in child.iterdir():
-                if is_backup(file):
-                    file.unlink()
-                    removed_files += 1
-            try:
-                child.rmdir()
-                removed_dirs += 1
-            except OSError:
-                pass
-        excel_log.clear_data()
-        db_log.clear_data()
-    return {"files": removed_files, "dirs": removed_dirs}
+def clear_inventory() -> None:
+    excel_log.clear_data(excel_log.INVENTORY_FILE)
+    db_log.clear_data(db_log.INVENTORY_DB)
+    delete_temp_files()
+    excel_log.delete_merge_sheet(excel_log.MAIN_FILE)
+    db_log.drop_merge(db_log.MAIN_DB)
+
+
+def clear_all_data() -> int:
+    """清空实时 + 盘点 + temp；历史备份文件夹保留。返回删除的 temp 数量。"""
+    removed = delete_temp_files()
+    clear_realtime()
+    clear_inventory()
+    return removed
