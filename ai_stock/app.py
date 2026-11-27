@@ -816,6 +816,49 @@ def compute_breadth_from_flow(flow: pd.DataFrame):
     }
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def get_hs_breadth_legu():
+    """乐咕乐股-沪深 A 股涨跌家数（软件常用口径），停牌计入平盘。"""
+    df = ak.stock_market_activity_legu()
+    data = {str(row["item"]).strip(): to_float(row["value"]) for _, row in df.iterrows()}
+    up = int(data.get("上涨") or 0)
+    down = int(data.get("下跌") or 0)
+    flat = int(data.get("平盘") or 0)
+    suspended = int(data.get("停牌") or 0)
+    total = up + down + flat + suspended
+    if total <= 0:
+        return None
+    return {
+        "up": up, "down": down, "flat": flat + suspended,
+        "suspended": suspended, "total": total,
+    }
+
+
+def get_bj_breadth():
+    """新浪快照中的北交所涨跌家数与成交额。"""
+    spot = get_a_spot()
+    if spot is None or spot.empty:
+        return None
+    codes = spot["代码"].astype(str)
+    bj = spot[codes.str.startswith(("4", "8", "920"))]
+    if bj.empty:
+        return None
+    pct = pd.to_numeric(bj["涨跌幅"], errors="coerce")
+    amount = pd.to_numeric(
+        bj.get("成交额", pd.Series(dtype=float)), errors="coerce"
+    )
+    valid = pct.notna()
+    if not valid.any():
+        return None
+    return {
+        "up": int((pct > 0).sum()),
+        "down": int((pct < 0).sum()),
+        "flat": int((pct == 0).sum()),
+        "total": int(valid.sum()),
+        "amount": float(amount[valid].fillna(0).sum()),
+    }
+
+
 def collect_index_snapshot() -> dict:
     errors = []
     try:
@@ -853,18 +896,53 @@ def collect_index_snapshot() -> dict:
     if market_amount_sh and market_amount_sz:
         market_amount = market_amount_sh + market_amount_sz
 
+    bj_breadth = None
+    try:
+        bj_breadth = get_bj_breadth()
+    except Exception as exc:
+        errors.append(f"北交所涨跌家数获取失败：{exc}")
+    market_amount_bj = bj_breadth["amount"] if bj_breadth else None
+    if market_amount is not None and market_amount_bj:
+        market_amount += market_amount_bj
+
     breadth = None
     flow_agg = None
-    breadth_source = "同花顺"
+    breadth_source = "沪深A股"
+
+    def _combine_bj(base: dict) -> dict:
+        if not bj_breadth:
+            return base
+        return {
+            "up": base["up"] + bj_breadth["up"],
+            "down": base["down"] + bj_breadth["down"],
+            "flat": base["flat"] + bj_breadth["flat"],
+            "total": base["total"] + bj_breadth["total"],
+        }
+
+    hs_breadth = None
+    try:
+        hs_breadth = get_hs_breadth_legu()
+    except Exception as exc:
+        errors.append(f"沪深涨跌家数获取失败：{exc}")
+    if hs_breadth:
+        breadth = _combine_bj(hs_breadth)
+        breadth_source = "沪深京·含北交所" if bj_breadth else "沪深A股"
+
     try:
         fund_flow = get_fund_flow()
         if not fund_flow.empty:
-            breadth = compute_breadth_from_flow(fund_flow)
             flow_agg = {
                 "inflow": float(pd.to_numeric(fund_flow["流入资金"], errors="coerce").fillna(0).sum()),
                 "outflow": float(pd.to_numeric(fund_flow["流出资金"], errors="coerce").fillna(0).sum()),
                 "net": float(pd.to_numeric(fund_flow["净额"], errors="coerce").fillna(0).sum()),
             }
+            if breadth is None:
+                ths_breadth = compute_breadth_from_flow(fund_flow)
+                if ths_breadth:
+                    breadth = _combine_bj(ths_breadth)
+                    breadth_source = (
+                        "沪深京·同花顺+北交所" if bj_breadth else "沪深A股·同花顺"
+                    )
             if market_amount is None:  # 指数成交额不可用时回退为个股成交额加总
                 amounts = pd.to_numeric(fund_flow["成交额"], errors="coerce").fillna(0)
                 amount_sum = float(amounts.sum())
@@ -875,11 +953,13 @@ def collect_index_snapshot() -> dict:
                     market_amount_sh = sh_amount
                     sz_amount = amount_sum - sh_amount
                     market_amount_sz = sz_amount if sz_amount > 0 else None
+                if market_amount is not None and market_amount_bj:
+                    market_amount += market_amount_bj
     except Exception as exc:
         errors.append(f"市场资金流获取失败：{exc}")
 
-    if breadth is None:  # 同花顺不可用时回退新浪口径
-        breadth_source = "新浪"
+    if breadth is None:  # 最后回退新浪全市场口径（已含北交所）
+        breadth_source = "沪深京·新浪"
         try:
             a_spot = get_a_spot()
             breadth = compute_market_breadth(a_spot)
@@ -914,6 +994,7 @@ def collect_index_snapshot() -> dict:
         "market_amount": market_amount,
         "market_amount_sh": market_amount_sh,
         "market_amount_sz": market_amount_sz,
+        "market_amount_bj": market_amount_bj,
         "flow_agg": flow_agg,
         "hsgt": hsgt,
         "main_flow": main_flow,
@@ -1219,15 +1300,15 @@ def refresh_snapshots() -> None:
 
 
 def render_market_breadth(breadth: dict, market_amount, market_amount_sh,
-                          market_amount_sz, flow_agg, breadth_source: str,
-                          hsgt, main_flow) -> None:
+                          market_amount_sz, market_amount_bj, flow_agg,
+                          breadth_source: str, hsgt, main_flow) -> None:
     up, down, flat = breadth["up"], breadth["down"], breadth["flat"]
     total = breadth["total"] or 1
     up_w = up / total * 100
     flat_w = flat / total * 100
     down_w = down / total * 100
     amount_txt = fmt_amount(market_amount) if market_amount else "--"
-    scope = "同花顺口径·沪深A股" if breadth_source == "同花顺" else "新浪口径"
+    scope = breadth_source
 
     flow_html = ""
     if flow_agg:
@@ -1294,6 +1375,11 @@ def render_market_breadth(breadth: dict, market_amount, market_amount_sh,
             "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>深市 "
             f"<span style='color:#333;font-weight:600'>{fmt_amount(market_amount_sz)}</span></span>"
         )
+    if market_amount_bj:
+        amount_parts.append(
+            "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>北交所 "
+            f"<span style='color:#333;font-weight:600'>{fmt_amount(market_amount_bj)}</span></span>"
+        )
     amount_parts.append(
         "<span style='color:#888;font-size:0.88rem;white-space:nowrap'>合计 "
         f"<span style='color:#333;font-weight:600'>{amount_txt}</span></span>"
@@ -1307,7 +1393,7 @@ def render_market_breadth(breadth: dict, market_amount, market_amount_sh,
     st.markdown(
         f"""<div style="border:1px solid #e6e6e6;border-radius:12px;padding:10px 14px;background:#fff;display:flex;flex-direction:column;gap:6px;margin-top:6px">
 <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
-<span style="color:#555;font-size:0.92rem;white-space:nowrap">沪深A股涨跌家数
+<span style="color:#555;font-size:0.92rem;white-space:nowrap">沪深京A股涨跌家数
 <span style="color:#bbb;font-size:0.75rem">（{scope}）</span></span>
 <span style="color:{UP_COLOR};font-weight:600;white-space:nowrap">上涨 {up:,} 家</span>
 <span style="color:{FLAT_COLOR};white-space:nowrap">平盘 {flat:,} 家</span>
@@ -1362,8 +1448,9 @@ def render_index_panel() -> None:
             snapshot.get("market_amount"),
             snapshot.get("market_amount_sh"),
             snapshot.get("market_amount_sz"),
+            snapshot.get("market_amount_bj"),
             snapshot.get("flow_agg"),
-            snapshot.get("breadth_source", "同花顺"),
+            snapshot.get("breadth_source", "沪深京·含北交所"),
             snapshot.get("hsgt"),
             snapshot.get("main_flow"),
         )
