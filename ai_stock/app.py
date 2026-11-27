@@ -25,6 +25,7 @@ from streamlit_sortables import sort_items
 
 import db_log
 import excel_log
+import storage_backup
 import strategies
 import strategy_bollinger
 import strategy_dual_ma
@@ -94,6 +95,15 @@ PERIOD_UNITS = {"日K": "日", "周K": "周", "月K": "月"}
 
 LOG_COLORS = {"info": "#111111", "debug": "#1e3a8a", "trade": "#111111"}
 LOG_MAX_ENTRIES = 100
+BTN_WIDTH = 170
+STORE_BUTTON_CSS = (
+    "<style>"
+    ".st-key-clear_all_btn button, .st-key-backup_btn button {"
+    "background-color:#dbeafe;color:#1e3a8a;border:1px solid #93c5fd;}"
+    ".st-key-clear_all_btn button:hover, .st-key-backup_btn button:hover {"
+    "background-color:#bfdbfe;color:#1e3a8a;border-color:#60a5fa;}"
+    "</style>"
+)
 
 WATCHLIST_FILE = Path(
     os.environ.get("WATCHLIST_FILE", Path(__file__).with_name("watchlist.json"))
@@ -387,6 +397,23 @@ def get_intraday(symbol: str) -> pd.DataFrame:
     df = df[df["时间"].dt.date == df["时间"].dt.date.max()].reset_index(drop=True)
     for col in ("开盘", "收盘", "最高", "最低", "成交量", "成交额"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_minute_bars_for_date(code: str, day: str) -> pd.DataFrame:
+    """指定交易日的 1 分钟数据（新浪仅保留最近约 5 个交易日）。"""
+    df = ak.stock_zh_a_minute(symbol=with_prefix(code), period="1", adjust="")
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.rename(columns={"day": "时间", "open": "开盘", "high": "最高",
+                            "low": "最低", "close": "收盘", "volume": "成交量",
+                            "amount": "成交额"})
+    df["时间"] = pd.to_datetime(df["时间"])
+    df = df[df["时间"].dt.strftime("%Y-%m-%d") == day].reset_index(drop=True)
+    for col in ("开盘", "收盘", "最高", "最低", "成交量", "成交额"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
@@ -971,13 +998,39 @@ def load_kline_before(code: str, trade_day: dt.date) -> pd.DataFrame:
     return get_kline(code, "daily", start, end)
 
 
-def run_replay(target_date: dt.date) -> dict:
-    """按所选日期，用已勾选策略盘点自选股信号，并写入日志/Excel/数据库（去重）。
+def _add_replay_entry(strategy, color, stock_name, code, action, price, when,
+                      trade_date, logged, entries) -> None:
+    log_key = f"{strategy}-{code}-{action}-{trade_date}"
+    if log_key not in logged:
+        logged.add(log_key)
+        add_log(
+            strategies.format_signal_log(
+                strategy, stock_name, action, f"{price:.2f}",
+                SIGNAL_QUANTITY, when, trade_date,
+            ),
+            level="trade",
+            color=color,
+        )
+    entries.append({
+        "strategy": strategy,
+        "stock": stock_name,
+        "action": action,
+        "price": price,
+        "quantity": SIGNAL_QUANTITY,
+        "time": when,
+        "date": trade_date,
+    })
 
-    与实时口径一致：交易日期记为所选日期，行情用该日期之前的日 K
-    （相当于当日盘中能拿到的数据），便于盘点结果与实时日志保持一致。
+
+def run_replay(target_date: dt.date) -> dict:
+    """按所选日期，用已勾选策略分钟级回放自选股信号，并写入日志/Excel/数据库。
+
+    历史为当日之前的日 K；叠加所选交易日的 1 分钟数据逐分钟演进当日 K 线，
+    首次满足买卖条件的分钟即为交易时间（如 14:55:11），价格取该分钟收盘价。
+    无分钟数据（历史日期）时回退为日线信号，交易时间记为 15:00:00。
     """
-    result = {"computed": 0, "excel": 0, "db": 0, "data_date": None}
+    result = {"computed": 0, "excel": 0, "db": 0, "data_date": None,
+              "minute": 0, "fallback": 0}
     codes = list(st.session_state.get("watchlist", []))
     if not codes:
         return result
@@ -991,57 +1044,97 @@ def run_replay(target_date: dt.date) -> dict:
     entries = []
     trade_date = target_date.strftime("%Y-%m-%d")
 
-    data_dates = []
-    for code in codes:
-        try:
-            daily = load_kline_before(code, target_date)
-        except Exception:
-            continue
-        if daily is not None and not daily.empty:
-            data_dates.append(
-                pd.to_datetime(daily["日期"].iloc[-1]).strftime("%Y-%m-%d")
-            )
-    result["data_date"] = max(data_dates) if data_dates else None
-
+    enabled = []
     for strategy, signal_fn in STRATEGY_RUNNERS.items():
         idx = QUANT_STRATEGIES.index(strategy)
-        if not st.session_state.get(f"strategy_{idx}"):
+        if st.session_state.get(f"strategy_{idx}"):
+            enabled.append((strategy, signal_fn, strategies.STRATEGY_COLORS[strategy]))
+    if not enabled:
+        return result
+
+    history_dates = []
+    for code in codes:
+        try:
+            history = load_kline_before(code, target_date)
+        except Exception:
             continue
-        color = strategies.STRATEGY_COLORS[strategy]
-        for code in codes:
-            try:
-                daily = load_kline_before(code, target_date)
-                action = signal_fn(daily)
-            except Exception:
-                continue
-            if action is None or daily.empty:
-                continue
-            price = to_float(daily["收盘"].iloc[-1])
-            if price is None:
-                continue
-            stock_name = names.get(code, code)
-            log_key = f"{strategy}-{code}-{action}-{trade_date}"
-            if log_key not in logged:
-                logged.add(log_key)
-                add_log(
-                    strategies.format_signal_log(
-                        strategy, stock_name, action, f"{price:.2f}",
-                        SIGNAL_QUANTITY, "15:00:00", trade_date,
-                    ),
-                    level="trade",
-                    color=color,
+        if history is None or history.empty:
+            continue
+        history_dates.append(
+            pd.to_datetime(history["日期"].iloc[-1]).strftime("%Y-%m-%d")
+        )
+        stock_name = names.get(code, code)
+        try:
+            minutes = get_minute_bars_for_date(code, trade_date)
+        except Exception:
+            minutes = pd.DataFrame()
+
+        if minutes.empty:
+            # 无分钟数据：回退为日线信号，交易时间记 15:00:00
+            result["fallback"] += 1
+            for strategy, signal_fn, color in enabled:
+                try:
+                    action = signal_fn(history)
+                except Exception:
+                    continue
+                if action is None:
+                    continue
+                price = to_float(history["收盘"].iloc[-1])
+                if price is None:
+                    continue
+                _add_replay_entry(
+                    strategy, color, stock_name, code, action, price,
+                    "15:00:00", trade_date, logged, entries,
                 )
-            entries.append({
-                "strategy": strategy,
-                "stock": stock_name,
-                "action": action,
-                "price": price,
-                "quantity": SIGNAL_QUANTITY,
-                "time": "15:00:00",
-                "date": trade_date,
-            })
+            continue
+
+        # 分钟级回放：历史日 K + 当日盘中演进的 K 线
+        result["minute"] += 1
+        day_open = float(minutes["开盘"].iloc[0])
+        highs = minutes["最高"].cummax().tolist()
+        lows = minutes["最低"].cummin().tolist()
+        vols = minutes["成交量"].fillna(0).cumsum().tolist()
+        if "成交额" in minutes.columns:
+            amts = minutes["成交额"].fillna(0).cumsum().tolist()
+        else:
+            amts = [0.0] * len(minutes)
+        closes = minutes["收盘"].tolist()
+        times = minutes["时间"].dt.strftime("%H:%M:%S").tolist()
+
+        found = {strategy: set() for strategy, _, _ in enabled}
+        for i in range(len(minutes)):
+            if all(len(found[s]) >= 2 for s, _, _ in enabled):
+                break
+            day_bar = pd.DataFrame([{
+                "日期": pd.Timestamp(trade_date),
+                "开盘": day_open,
+                "最高": float(highs[i]),
+                "最低": float(lows[i]),
+                "收盘": float(closes[i]),
+                "成交量": float(vols[i]),
+                "成交额": float(amts[i]),
+            }])
+            candidate = pd.concat([history, day_bar], ignore_index=True)
+            for strategy, signal_fn, color in enabled:
+                if len(found[strategy]) >= 2:
+                    continue
+                try:
+                    action = signal_fn(candidate)
+                except Exception:
+                    continue
+                if action is None or action in found[strategy]:
+                    continue
+                price = to_float(closes[i])
+                if price is None:
+                    continue
+                found[strategy].add(action)
+                _add_replay_entry(
+                    strategy, color, stock_name, code, action, price,
+                    times[i], trade_date, logged, entries,
+                )
 
     result["computed"] = len(entries)
+    result["data_date"] = max(history_dates) if history_dates else None
     if entries:
         try:
             result["excel"] = excel_log.append_trade_logs(entries, dedupe=True)
@@ -1255,6 +1348,48 @@ def _toggle_all_strategies() -> None:
         st.session_state[f"strategy_{i}"] = value
 
 
+def _perform_backup_clear() -> str:
+    info = storage_backup.backup_and_clear()
+    st.session_state.pop("replay_logged_keys", None)
+    return f"已备份到 {info['folder'].name} 文件夹，并清空当前数据"
+
+
+def _perform_clear_all() -> str:
+    info = storage_backup.clear_all()
+    st.session_state.pop("replay_logged_keys", None)
+    return f"已删除 {info['files']} 个备份文件，并清空当前数据"
+
+
+@st.dialog("确认备份并清空当前数据")
+def _dialog_backup_clear() -> None:
+    st.warning("将把当前 ai_stock.xlsx / ai_stock.db 备份到日期文件夹，然后清空当前数据。")
+    c1, c2 = st.columns(2)
+    if c1.button("确认备份并清空", type="primary", key="confirm_backup_btn", width="stretch"):
+        try:
+            msg = _perform_backup_clear()
+        except Exception as exc:
+            msg = f"备份失败：{exc}"
+        st.session_state["store_action_msg"] = msg
+        st.rerun()
+    if c2.button("取消", key="cancel_backup_btn", width="stretch"):
+        st.rerun()
+
+
+@st.dialog("确认清空所有数据")
+def _dialog_clear_all() -> None:
+    st.warning("将删除所有备份文件，并清空当前 Excel 与数据库数据，且不可恢复。")
+    c1, c2 = st.columns(2)
+    if c1.button("确认清空所有", type="primary", key="confirm_clear_all_btn", width="stretch"):
+        try:
+            msg = _perform_clear_all()
+        except Exception as exc:
+            msg = f"清空失败：{exc}"
+        st.session_state["store_action_msg"] = msg
+        st.rerun()
+    if c2.button("取消", key="cancel_clear_all_btn", width="stretch"):
+        st.rerun()
+
+
 @st.fragment
 def render_quant_strategy_box() -> None:
     """独立 fragment：勾选策略只重跑本区域，不触发整页重跑（避免全页发白）。"""
@@ -1304,7 +1439,7 @@ def render_quant_strategy_box() -> None:
             )
 
         st.divider()
-        btn_col, date_col = st.columns([1, 1.5], vertical_alignment="bottom")
+        btn_col, date_col = st.columns([1, 1.6], vertical_alignment="bottom")
         with date_col:
             replay_date = st.date_input(
                 "盘点日期",
@@ -1314,7 +1449,7 @@ def render_quant_strategy_box() -> None:
             )
         with btn_col:
             replay_clicked = st.button(
-                "盘点数据", key="replay_btn", type="primary", width="stretch"
+                "盘点数据", key="replay_btn", type="primary", width=BTN_WIDTH
             )
         if replay_clicked:
             if not st.session_state.get("watchlist"):
@@ -1328,26 +1463,37 @@ def render_quant_strategy_box() -> None:
                 if stats["computed"] == 0:
                     st.info(
                         f"盘点完成：{replay_date} 没有产生交易信号"
-                        f"（行情数据截至 {data_date}）。"
+                        f"（日线历史截至 {data_date}）。"
                     )
                 else:
+                    extra = f"（日线历史截至 {data_date}"
+                    if stats["fallback"]:
+                        extra += (
+                            f"，{stats['fallback']} 只股票无当日分钟数据，"
+                            "交易时间按 15:00:00 记录"
+                        )
+                    extra += "）"
                     st.success(
                         f"盘点完成：生成 {stats['computed']} 条信号，"
                         f"新增入库 Excel {stats['excel']} 条 / 数据库 {stats['db']} 条"
-                        f"（行情数据截至 {data_date}，交易日期记为 {replay_date}）"
+                        f"{extra}"
                     )
-        if st.button("清除数据", key="clear_btn"):
-            try:
-                excel_log.clear_data()
-                db_log.clear_data()
-                st.session_state.pop("replay_logged_keys", None)
-                st.success("已清空 Excel 与数据库中的全部交易数据")
-            except Exception as exc:
-                st.error(f"清除失败：{exc}")
+        st.markdown(STORE_BUTTON_CSS, unsafe_allow_html=True)
+        clear_col, backup_col = st.columns(2)
+        if clear_col.button("清空所有数据", key="clear_all_btn", width=BTN_WIDTH):
+            _dialog_clear_all()
+        if backup_col.button(
+            "备份并清空当前数据", key="backup_btn", width=BTN_WIDTH
+        ):
+            _dialog_backup_clear()
+        action_msg = st.session_state.pop("store_action_msg", None)
+        if action_msg:
+            st.success(action_msg)
         st.caption(
-            "盘点使用所选日期之前的日 K 线（模拟当日盘中可获取的行情），"
-            "交易日期记为所选日期，提示时间记为 15:00:00；"
-            "清除数据会删除 Excel 与数据库中的全部交易记录。"
+            "盘点按所选交易日的分钟数据逐分钟回放（日线历史截至前一日），"
+            "交易时间取首次满足买卖条件的时刻，无分钟数据时按 15:00:00 回退；"
+            "「备份并清空」会把当前文件备份到以日期命名的文件夹后清空，"
+            "「清空所有数据」会删除全部备份并清空当前数据。"
         )
 
 

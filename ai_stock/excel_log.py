@@ -17,7 +17,7 @@ EXCEL_FILE = Path(
     os.environ.get("AI_STOCK_EXCEL", Path(__file__).with_name("ai_stock.xlsx"))
 )
 
-HEADER = ["量化策略名称", "股票名称", "买卖", "当前交易价格", "数量", "提示时间", "交易日期"]
+HEADER = ["量化策略名称", "股票名称", "买卖", "当前交易价格", "数量", "交易时间", "交易日期"]
 ALL_SHEET = "all_deal"
 SEQUENCE = [ALL_SHEET] + strategies.STRATEGY_NAMES
 COLUMN_WIDTHS = [18, 14, 8, 14, 10, 14, 14]
@@ -49,6 +49,8 @@ def _prepare_sheet(ws) -> None:
             cell.value = name
             cell.font = Font(bold=True, color="FF111111")
             cell.fill = PatternFill(fill_type="solid", start_color="FFF2F2F2", end_color="FFF2F2F2")
+        elif col == 6 and cell.value == "提示时间":
+            cell.value = "交易时间"  # 旧表头迁移
     for idx, width in enumerate(COLUMN_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
 
